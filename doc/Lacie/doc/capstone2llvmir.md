@@ -186,6 +186,136 @@ std::map<
 
 未实现的指令会被降级为**伪汇编函数调用**。
 
+---
+
+## 指令支持统计
+
+根据 `src/capstone2llvmir/x86/x86_init.cpp` 中的 `_i2fm` 映射表统计：
+
+| 统计项 | 数量 | 占比 |
+|--------|------|------|
+| **总指令条目** | 1,343 | 100% |
+| **已实现翻译** | 281 | 20.9% |
+| **未实现 (nullptr)** | 1,062 | 79.1% |
+
+### 已实现指令分类 (281 条)
+
+| 类别 | 指令数 | 示例 |
+|------|--------|------|
+| **控制流/跳转** | 48 | `JMP`, `JE`, `CALL`, `RET`, `LOOP`, `JECXZ` |
+| **数据传输** | 45 | `MOV`, `PUSH`, `POP`, `LEA`, `MOVSX`, `MOVZX` |
+| **算术运算** | 38 | `ADD`, `SUB`, `MUL`, `IMUL`, `DIV`, `IDIV`, `INC`, `DEC` |
+| **逻辑运算** | 24 | `AND`, `OR`, `XOR`, `NOT`, `TEST` |
+| **移位/旋转** | 24 | `SHL`, `SHR`, `SAR`, `ROL`, `ROR`, `RCL`, `RCR`, `SHLD`, `SHRD` |
+| **条件传送** | 32 | `CMOVA`, `CMOVE`, `FCMOVBE` 等 |
+| **条件设置** | 16 | `SETE`, `SETNE`, `SETG` 等 |
+| **比较/位测试** | 26 | `CMP`, `BT`, `BTC`, `BTR`, `BTS`, `BSF`, `BSR`, `CMPXCHG` |
+| **字符串操作** | 24 | `MOVSB`, `LODSB`, `STOSB`, `SCASB`, `CMPSB` 等 |
+| **FPU 浮点** | 52 | `FADD`, `FSUB`, `FMUL`, `FDIV`, `FLD`, `FST`, `FCOM` 等 |
+| **其他系统指令** | 12 | `CPUID`, `RDTSC`, `NOP`, `ENTER`, `LEAVE`, `XLATB` |
+
+### 未实现指令分类 (1,062 条)
+
+| 指令集类别 | 数量 | 说明 |
+|------------|------|------|
+| **AVX/AVX2/AVX-512 向量指令** | ~400+ | 所有 `V*` 开头的指令，如 `VADDPD`, `VMOVAPS`, `VPADDB` |
+| **SSE/SSE2/SSE3/SSSE3/SSE4 向量指令** | ~200+ | `ADDPS`, `MOVAPS`, `SHUFPS`, `BLENDPD` 等 |
+| **AES-NI 加密指令** | 6 | `AESENC`, `AESDEC`, `AESIMC`, `AESKEYGENASSIST` 等 |
+| **PCLMULQDQ 指令** | 1 | `PCLMULQDQ` |
+| **SHA 扩展指令** | 7 | `SHA1MSG1`, `SHA256MSG2` 等 |
+| **BMI/BMI2/TBM 位操作** | ~20+ | `ANDN`, `BEXTR`, `BZHI`, `BLSI`, `BLSR` 等 |
+| **FMA 融合乘加** | ~20+ | `VFMADDPD`, `VFMSUBPS` 等 |
+| **MPX 内存保护** | ~10 | `BNDMK`, `BNDCL`, `BNDCU` 等 |
+| **VMX/VT-x 虚拟化** | ~15 | `INVEPT`, `INVVPID`, `VMCALL` 等 |
+| **系统管理指令** | ~10 | `MONITOR`, `MWAIT`, `GETSEC`, `VMCALL` 等 |
+| **其他遗留/特殊指令** | ~300+ | `ARPL`, `BOUND`, `CLTS`, `LAR`, `LSL` 等 |
+
+### 主要未实现指令列表
+
+```cpp
+// SSE 系列 (Streaming SIMD Extensions)
+{X86_INS_ADDPS, nullptr},       // ADD Packed Single
+{X86_INS_ADDSS, nullptr},       // ADD Scalar Single
+{X86_INS_MULPS, nullptr},       // MUL Packed Single
+{X86_INS_DIVPS, nullptr},       // DIV Packed Single
+{X86_INS_ANDPS, nullptr},       // AND Packed Single
+{X86_INS_XORPS, nullptr},       // XOR Packed Single
+{X86_INS_MOVAPS, nullptr},      // MOV Aligned Packed Single
+{X86_INS_SHUFPS, nullptr},      // Shuffle Packed Single
+{X86_INS_UNPCKHPS, nullptr},    // Unpack High Packed Single
+
+// SSE2 双精度浮点
+{X86_INS_ADDPD, nullptr},       // ADD Packed Double
+{X86_INS_MULPD, nullptr},       // MUL Packed Double
+{X86_INS_DIVPD, nullptr},       // DIV Packed Double
+{X86_INS_CVTPS2PD, nullptr},    // Convert PS to PD
+{X86_INS_CVTPD2PS, nullptr},    // Convert PD to PS
+
+// AVX 向量指令 (256-bit)
+{X86_INS_VADDPD, nullptr},      // Vector ADD Packed Double
+{X86_INS_VADDPS, nullptr},      // Vector ADD Packed Single
+{X86_INS_VADDSD, nullptr},      // Vector ADD Scalar Double
+{X86_INS_VADDSS, nullptr},      // Vector ADD Scalar Single
+{X86_INS_VANDPS, nullptr},      // Vector AND Packed Single
+{X86_INS_VXORPS, nullptr},      // Vector XOR Packed Single
+{X86_INS_VMOVAPS, nullptr},     // Vector MOV Aligned Packed Single
+{X86_INS_VSHUFPS, nullptr},     // Vector Shuffle Packed Single
+
+// AVX2 整数向量
+{X86_INS_VPADDB, nullptr},      // Vector Packed ADD Byte
+{X86_INS_VPADDW, nullptr},      // Vector Packed ADD Word
+{X86_INS_VPADDD, nullptr},      // Vector Packed ADD Dword
+{X86_INS_VPMULUDQ, nullptr},    // Vector Packed MUL Unsigned Qword
+
+// AVX-512 指令
+{X86_INS_VADDPD, nullptr},      // 512-bit vector add
+{X86_INS_VFMADDPD, nullptr},    // Fused Multiply-Add Packed Double
+{X86_INS_VFMADDPS, nullptr},    // Fused Multiply-Add Packed Single
+{X86_INS_VGATHERDPS, nullptr},  // Gather Packed Single
+
+// AES-NI 加密
+{X86_INS_AESENC, nullptr},              // AES Encrypt
+{X86_INS_AESDEC, nullptr},              // AES Decrypt
+{X86_INS_AESIMC, nullptr},              // AES Inv Mix Columns
+{X86_INS_AESKEYGENASSIST, nullptr},     // AES Key Gen Assist
+
+// SHA 扩展
+{X86_INS_SHA1MSG1, nullptr},    // SHA1 Message Schedule 1
+{X86_INS_SHA1MSG2, nullptr},    // SHA1 Message Schedule 2
+{X86_INS_SHA1RNDS4, nullptr},   // SHA1 Round 4
+{X86_INS_SHA256MSG1, nullptr},  // SHA256 Message Schedule 1
+{X86_INS_SHA256MSG2, nullptr},  // SHA256 Message Schedule 2
+
+// BMI 位操作
+{X86_INS_ANDN, nullptr},        // And Not
+{X86_INS_BEXTR, nullptr},       // Bit Extract
+{X86_INS_BZHI, nullptr},        // Zero High Bits
+{X86_INS_BLSI, nullptr},        // Bls Isolate
+{X86_INS_BLSR, nullptr},        // Bls Reset
+
+// 系统/虚拟化
+{X86_INS_MONITOR, nullptr},     // Monitor Address
+{X86_INS_MWAIT, nullptr},       // Monitor Wait
+{X86_INS_INVEPT, nullptr},      // Invalidate EPT Entry
+{X86_INS_INVVPID, nullptr},     // Invalidate VPID
+{X86_INS_GETSEC, nullptr},      // Get Security State
+
+// 其他未实现
+{X86_INS_BOUND, nullptr},       // Check Array Bounds
+{X86_INS_ARPL, nullptr},        // Adjust RPL
+{X86_INS_CLTS, nullptr},        // Clear Task Switched
+{X86_INS_LAR, nullptr},         // Load Access Rights
+{X86_INS_LSL, nullptr},         // Load Segment Limit
+```
+
+### 实现状态说明
+
+- ✅ **已支持 (20.9%)**：基础 x86 指令、通用控制流、整数运算、基本 FPU、字符串操作
+- ⚠️ **部分支持**：FPU 指令（基本运算支持，部分控制指令未实现）
+- ❌ **未支持 (79.1%)**：所有 SIMD 向量指令（SSE/AVX）、加密指令、高级位操作、虚拟化指令
+
+**注意**：未实现的指令不会被忽略，而是生成**伪汇编函数调用**（如 `@__pseudo_asm_aesenc`），保留原始语义以便后续手动分析或扩展支持。
+
 ## 转换函数实现
 
 ### 位置
