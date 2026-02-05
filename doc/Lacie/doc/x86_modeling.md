@@ -80,6 +80,7 @@
 x86 寄存器存在重叠关系（如 AL/AH/AX/EAX/RAX）。RetDec 通过 **父寄存器映射** 处理：
 
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:661
 // 32位模式下的寄存器层级
 {X86_REG_AH, X86_REG_AL, X86_REG_AX, X86_REG_EAX},
 {X86_REG_CH, X86_REG_CL, X86_REG_CX, X86_REG_ECX},
@@ -112,10 +113,13 @@ mov al, bl
 store i32 %eax_final, i32* @eax
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:661` - `loadRegister()` 函数
+
 ### 2.3 寄存器访问接口
 
 **loadRegister()** - 读取寄存器值：
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:661
 llvm::Value* loadRegister(uint32_t r, IRBuilder<>& irb, Type* dstType);
 
 // 示例: loadRegister(X86_REG_EAX, irb)
@@ -124,6 +128,7 @@ llvm::Value* loadRegister(uint32_t r, IRBuilder<>& irb, Type* dstType);
 
 **storeRegister()** - 写入寄存器值：
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:713
 StoreInst* storeRegister(uint32_t r, Value* val, IRBuilder<>& irb);
 
 // 示例: storeRegister(X86_REG_EAX, newVal, irb)
@@ -157,6 +162,8 @@ mov eax, [0x1000]      ; 从地址 0x1000 读取 32 位
 store i32 %eax, i32* @eax
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:958` - `loadOp()` 函数 (X86_OP_MEM 分支)
+
 ### 3.2 复杂寻址模式
 
 x86 支持复杂寻址：`[base + index*scale + disp]`
@@ -180,6 +187,8 @@ mov eax, [ebx + ecx*4 + 8]
 %val = load i32, i32* %val_ptr
 store i32 %val, i32* @eax
 ```
+
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:978-995` - loadOp() 中 mem.base/mem.index 处理
 
 ### 3.3 段地址空间（x86 特殊）
 
@@ -254,6 +263,7 @@ x86 的 EFLAGS 寄存器被分解为独立的全局布尔变量：
 
 **零标志 (ZF) 生成：**
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:1312
 Value* generateZeroFlag(Value* val, IRBuilder<>& irb) {
     // ZF = (val == 0)
     return irb.CreateICmpEQ(val, ConstantInt::get(val->getType(), 0));
@@ -262,6 +272,7 @@ Value* generateZeroFlag(Value* val, IRBuilder<>& irb) {
 
 **符号标志 (SF) 生成：**
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:1320
 Value* generateSignFlag(Value* val, IRBuilder<>& irb) {
     // SF = val的最高位
     unsigned bitWidth = val->getType()->getIntegerBitWidth();
@@ -274,6 +285,7 @@ Value* generateSignFlag(Value* val, IRBuilder<>& irb) {
 
 **奇偶标志 (PF) 生成：**
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:1335
 Value* generateParityFlag(Value* val, IRBuilder<>& irb) {
     // PF = 低8位中1的个数为偶数
     Value* low8 = irb.CreateTrunc(val, Type::getInt8Ty(irb.getContext()));
@@ -315,6 +327,8 @@ store i1 %cf, i1* @cf
 store i1 %of, i1* @of
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:1729` - `translateAdd()` 函数
+
 ---
 
 ## 5. 操作数类型处理
@@ -336,6 +350,7 @@ enum x86_op_type {
 `loadOp()` 是数据流分析的核心入口，根据操作数类型分发处理：
 
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:958
 llvm::Value* loadOp(cs_x86_op& op, IRBuilder<>& irb, Type* ty, bool lea) {
     switch (op.type) {
         case X86_OP_REG:
@@ -347,11 +362,11 @@ llvm::Value* loadOp(cs_x86_op& op, IRBuilder<>& irb, Type* ty, bool lea) {
         case X86_OP_MEM:
             if (lea) {
                 // LEA 指令：只计算地址，不访问内存
-                return calculateAddress(op.mem, irb);
+                return calculateAddress(op.mem, irb);  // 隐式在 loadOp 中实现
             } else {
                 // 普通内存访问
                 Value* addr = calculateAddress(op.mem, irb);
-                return loadMemory(addr, ty, irb);
+                return loadMemory(addr, ty, irb);  // 隐式在 loadOp 中实现
             }
             
         default:
@@ -363,6 +378,7 @@ llvm::Value* loadOp(cs_x86_op& op, IRBuilder<>& irb, Type* ty, bool lea) {
 ### 5.3 storeOp() 函数
 
 ```cpp
+// src/capstone2llvmir/x86/x86.cpp:1046
 Instruction* storeOp(cs_x86_op& op, Value* val, IRBuilder<>& irb) {
     switch (op.type) {
         case X86_OP_REG:
@@ -395,6 +411,8 @@ store i32 %ebx_val, i32* @eax
 ; 注意：MOV 不修改标志位
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2520` - `translateMov()` 函数
+
 #### MOVSX/MOVZX (带符号/零扩展)
 ```asm
 movsx eax, bl   ; 8位到32位符号扩展
@@ -413,6 +431,8 @@ store i32 %bl_ext, i32* @eax
 store i32 %bl_ext, i32* @eax
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2520` - `translateMov()` 函数 (MOVSX/MOVZX 分支)
+
 #### XCHG (交换)
 ```asm
 xchg eax, ebx
@@ -424,6 +444,8 @@ xchg eax, ebx
 store i32 %ebx_val, i32* @eax
 store i32 %eax_val, i32* @ebx
 ```
+
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2520` - `translateMov()` 函数 (XCHG 分支)
 
 ### 6.2 栈操作指令（数据流关键点）
 
@@ -445,6 +467,8 @@ store i32 %esp_new, i32* @esp
 store i32 %eax_val, i32* %ptr
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2891` - `translatePush()` 函数
+
 #### POP
 ```asm
 pop eax
@@ -463,6 +487,8 @@ store i32 %val, i32* @eax
 store i32 %esp_new, i32* @esp
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2746` - `translatePop()` 函数
+
 #### LEA (加载有效地址)
 ```asm
 lea eax, [ebx + ecx*4 + 8]
@@ -477,6 +503,8 @@ lea eax, [ebx + ecx*4 + 8]
 %final = add i32 %sum, 8
 store i32 %final, i32* @eax
 ```
+
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2419` - `translateLea()` 函数
 
 ### 6.3 函数调用/返回（控制流与数据流交汇）
 
@@ -502,6 +530,8 @@ call void @__x86_call(i32 4198400)  ; 0x401000
 br label %block_401000
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:2334` - `translateCall()` 函数
+
 #### RET
 ```asm
 ret
@@ -524,6 +554,8 @@ call void @__x86_return(i32 %ret_addr)
 ; 4. 间接跳转
 br label %unknown_return_target  ; 实际会被分析器重定向
 ```
+
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:3030` - `translateRet()` 函数
 
 ### 6.4 字符串操作指令（循环数据流）
 
@@ -572,6 +604,8 @@ loop_body:
 loop_end:
 ```
 
+> 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:3755` - `translateMoveString()` 函数
+
 ---
 
 ## 7. 控制流建模（伪函数调用）
@@ -610,6 +644,8 @@ if_else:
 fall_through:
 ```
 
+> 📍 **代码位置**: 条件分支在 `src/capstone2llvmir/x86/x86.cpp` 各条件跳转指令翻译函数中处理
+
 ---
 
 ## 8. 数据流分析建议
@@ -630,6 +666,7 @@ fall_through:
 **寄存器别名：**
 - 写入 `@eax` 会影响 `@ax`, `@ah`, `@al`
 - 需要维护寄存器重叠关系图
+- 📍 **代码位置**: `src/capstone2llvmir/x86/x86.cpp:661` - `loadRegister()` 处理子寄存器
 
 **内存别名：**
 - 不同的地址计算可能指向同一位置
@@ -683,9 +720,34 @@ fall_through:
 
 ---
 
-## 10. 参考
+## 10. 核心函数速查表
+
+| 函数 | 文件 | 行号 | 用途 |
+|------|------|------|------|
+| `loadRegister()` | x86.cpp | 661 | 读取寄存器值 |
+| `storeRegister()` | x86.cpp | 713 | 写入寄存器值 |
+| `loadOp()` | x86.cpp | 958 | 加载操作数（寄存器/立即数/内存） |
+| `storeOp()` | x86.cpp | 1046 | 存储操作数到寄存器/内存 |
+| `generateZeroFlag()` | x86.cpp | 1312 | 生成零标志位 |
+| `generateSignFlag()` | x86.cpp | 1320 | 生成符号标志位 |
+| `generateParityFlag()` | x86.cpp | 1335 | 生成奇偶标志位 |
+| `translateAdd()` | x86.cpp | 1729 | ADD/ADC/SUB 等指令翻译 |
+| `translateCall()` | x86.cpp | 2334 | CALL 指令翻译 |
+| `translateLea()` | x86.cpp | 2419 | LEA 指令翻译 |
+| `translateMov()` | x86.cpp | 2520 | MOV/MOVSX/MOVZX/XCHG 翻译 |
+| `translatePop()` | x86.cpp | 2746 | POP 指令翻译 |
+| `translatePush()` | x86.cpp | 2891 | PUSH 指令翻译 |
+| `translateRet()` | x86.cpp | 3030 | RET 指令翻译 |
+| `translateMoveString()` | x86.cpp | 3755 | MOVS/STOS/LODS 字符串指令翻译 |
+
+---
+
+## 11. 参考
 
 - [RetDec 源码](https://github.com/avast/retdec/tree/master/src/capstone2llvmir/x86)
+  - 核心实现: `src/capstone2llvmir/x86/x86.cpp`
+  - 指令映射: `src/capstone2llvmir/x86/x86_init.cpp`
+  - 头文件: `src/capstone2llvmir/x86/x86_impl.h`
 - [Capstone x86 文档](https://www.capstone-engine.org/op_x86.html)
 - [Intel 64 and IA-32 Architectures Software Developer's Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
 - [LLVM Language Reference](https://llvm.org/docs/LangRef.html)

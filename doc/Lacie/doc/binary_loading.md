@@ -201,11 +201,344 @@ public:
 - 符号表 (Symbol Table)
 - 字符串表 (String Table)
 
+### 2.5 格式工厂详解
+
+#### 什么是格式工厂？
+
+**格式工厂 (Format Factory)** 是 RetDec 中使用的设计模式，用于根据输入文件的类型自动创建对应的文件格式解析器。
+
+```cpp
+// src/fileformat/format_factory.cpp:29
+std::unique_ptr<FileFormat> createFileFormat(
+    const std::string &filePath,
+    const std::string &dllListFile,
+    bool isRaw,              // 关键参数：是否为裸二进制
+    LoadFlags loadFlags
+) {
+    switch (detectFileFormat(filePath, isRaw))
+    {
+        case Format::PE:     return std::make_unique<PeFormat>(...);
+        case Format::ELF:    return std::make_unique<ElfFormat>(...);
+        case Format::COFF:   return std::make_unique<CoffFormat>(...);
+        case Format::MACHO:  return std::make_unique<MachOFormat>(...);
+        case Format::RAW_DATA: return std::make_unique<RawDataFormat>(...);
+        default:             return nullptr;
+    }
+}
+```
+
+**设计思想：**
+- 类似于现实世界中的工厂：根据订单（文件类型）生产对应的产品（解析器）
+- 使用者不需要知道具体创建的是哪种解析器，只需要调用统一的接口
+- 新增文件格式支持时，只需在工厂中添加新的 case 分支
+
+### 2.6 isRaw 参数详解
+
+#### 什么是 isRaw？
+
+**`isRaw`** 是格式检测和创建函数的关键参数，表示**输入是否为原始二进制数据（裸二进制）**。
+
+#### 标准可执行文件 vs 原始二进制
+
+| 特性 | 标准可执行文件 | 原始二进制 (Raw Binary) |
+|------|--------------|-----------------------|
+| 文件头 | 有（PE/ELF/Mach-O 头） | 无 |
+| 段表 | 有 | 无 |
+| 符号表 | 可能有 | 无 |
+| 入口点 | 从文件头读取 | 默认为 0 |
+| 架构信息 | 从文件头读取 | 需手动指定 |
+| 典型用途 | 普通程序 | 固件、引导扇区、内存转储 |
+
+#### isRaw 的工作原理
+
+```cpp
+// src/fileformat/utils/format_detection.cpp:211
+Format detectFileFormat(std::istream &inputStream, bool isRaw)
+{
+    // 如果标记为 Raw，直接返回 RAW_DATA 格式
+    // 跳过所有文件头魔数检测逻辑
+    if (isRaw)
+    {
+        return Format::RAW_DATA;
+    }
+    
+    // 否则，尝试检测文件头魔数...
+    // 检测 PE (MZ)、ELF (0x7FELF)、Mach-O (0xFEEDFACE) 等
+    for(const auto &item : magicFormatMap)
+    {
+        if(hasSubstringOnPosition(magic, item.first.second, item.first.first))
+        {
+            return item.second;  // 返回检测到的格式
+        }
+    }
+}
+```
+
+#### RawDataFormat 的特点
+
+当 `isRaw = true` 时，RetDec 使用 `RawDataFormat` 解析器：
+
+```cpp
+// src/fileformat/file_format/raw_data/raw_data_format.cpp:56
+void RawDataFormat::initStructures()
+{
+    fileFormat = Format::RAW_DATA;
+    
+    // 将整个文件视为一个代码段
+    section = new Section;
+    section->setName(".text");              // 默认段名
+    section->setType(Section::Type::CODE);  // 标记为代码段
+    section->setAddress(0);                  // 默认基地址为 0
+    section->setSizeInFile(bytes.size());    // 文件大小 = 段大小
+    sections.push_back(section);
+}
+```
+
+#### 使用场景示例
+
+**场景 1：分析标准可执行文件**
+```bash
+retdec-decompiler input.exe
+# isRaw = false
+# 检测文件头 -> 识别为 PE 格式 -> 使用 PeFormat 解析器
+```
+
+**场景 2：分析裸二进制（如固件）**
+```bash
+retdec-decompiler --raw --arch x86 --base 0x8000 firmware.bin
+# isRaw = true
+# 跳过文件头检测 -> 直接使用 RawDataFormat 解析器
+# 需要手动指定架构和基地址
+```
+
+#### 为什么需要 isRaw？
+
+1. **固件分析**：嵌入式设备的固件通常是裸二进制格式
+2. **内存转储**：从内存中转储出的代码没有文件头
+3. **引导扇区**：MBR、bootloader 等通常是裸二进制
+4. **避免误判**：某些数据文件可能恰好包含 PE/ELF 的魔数字节
+
 ---
 
 ## 3. 内存镜像加载层 (Loader)
 
-### 3.1 镜像工厂
+### 3.1 镜像是什么？
+
+在 RetDec 中，**镜像 (Image)** 是将可执行文件加载到内存后的抽象表示。它模拟了操作系统加载器的行为，将磁盘上的文件格式（PE/ELF/Mach-O）转换为进程内存空间的模型。
+
+#### 核心概念对比
+
+| 概念 | 类比 | 说明 |
+|------|------|------|
+| **文件 (File)** | 硬盘上的程序文件 | 存储在磁盘上的静态数据 |
+| **FileFormat** | 文件解析器 | 理解 PE/ELF 等文件格式的结构 |
+| **镜像 (Image)** | 内存中的进程 | 模拟操作系统加载后的内存状态 |
+| **段 (Segment)** | 内存页/区域 | 具有相同权限的连续内存块 |
+
+#### 文件与内存的区别
+
+```
+磁盘上的 PE 文件                    内存中的进程镜像
+┌─────────────────┐                ┌──────────────────────┐
+│ DOS Header      │                │                      │
+│ PE Header       │ ───加载───>    │  .text (代码段)       │
+│ 段表 (Section   │   转换         │      0x401000        │
+│   Table)        │                │  .data (数据段)       │
+│ .text (代码)    │                │      0x402000        │
+│ .data (数据)    │                │  .bss (未初始化数据)   │
+│ .rdata (只读)   │                │      0x403000        │
+│ ...             │                │                      │
+└─────────────────┘                └──────────────────────┘
+        ↓                                   ↓
+   按文件组织                        按虚拟地址组织
+   (偏移量 Offset)                  (虚拟地址 VA)
+```
+
+### 3.2 为什么需要镜像？
+
+#### 原因 1：地址转换
+
+文件使用**文件偏移量**（相对于文件开头的偏移），而程序运行时使用**虚拟地址**。Image 提供统一的虚拟地址访问接口：
+
+```cpp
+// PE 文件中：代码在文件偏移 0x400 处
+// 内存中：代码在虚拟地址 0x401000 处
+
+// Image 提供统一的虚拟地址访问
+Image->getByte(0x401000);  // 直接通过虚拟地址访问
+```
+
+#### 原因 2：内存布局模拟
+
+```cpp
+// src/loader/loader/pe/pe_image.cpp:32
+bool PeImage::load()
+{
+    // 从 PE 文件读取 ImageBase (首选加载地址)
+    std::uint64_t imageBase;
+    peFormat->getImageBaseAddress(imageBase);  // 例如：0x400000
+    setBaseAddress(imageBase);
+    
+    // 将每个节（Section）转换为内存段（Segment）
+    for (const auto& section : sections)
+    {
+        // 计算虚拟地址：VA = ImageBase + RVA
+        std::uint64_t virtualAddress = section->getAddress();
+        // ...
+        
+        // 创建 Segment 并加入 Image
+        addSegment(section, virtualAddress, virtualSize);
+    }
+}
+```
+
+#### 原因 3：段权限管理
+
+```cpp
+// 代码段：可读、可执行
+// 数据段：可读、可写
+// 只读段：只读
+
+// Image 为每个 Segment 维护权限信息
+Segment->isReadable();
+Segment->isWritable();
+Segment->isExecutable();
+```
+
+#### 原因 4：BSS 段处理
+
+```cpp
+// BSS 段在文件中不占空间（只有大小信息）
+// 但加载到内存后需要分配零初始化空间
+
+// src/loader/loader/pe/pe_image.cpp:87
+if (!section->isBss())
+{
+    // 从文件加载数据
+    dataSource.reset(new SegmentDataSource(sectionContent));
+}
+// BSS 段：Segment 存在，但没有数据源（全零）
+```
+
+### 3.3 镜像的核心组件
+
+#### Image 类
+
+```cpp
+// include/retdec/loader/loader/image.h
+class Image {
+public:
+    // 按虚拟地址读取数据
+    bool getByte(std::uint64_t address, std::uint64_t& res);
+    bool getWord(std::uint64_t address, std::uint64_t& res);
+    bool getXByte(std::uint64_t address, std::uint64_t x, std::uint64_t& res);
+    
+    // 段管理
+    Segment* getSegmentFromAddress(std::uint64_t address);
+    std::size_t getNumberOfSegments() const;
+    
+    // 基地址
+    std::uint64_t getBaseAddress() const;
+    
+    // 数据源
+    retdec::fileformat::FileFormat* getFileFormat();
+};
+```
+
+#### Segment 类
+
+```cpp
+// include/retdec/loader/loader/segment.h
+class Segment {
+    const SecSeg* _secSeg;          // 关联的文件段/节
+    std::uint64_t _address;         // 虚拟地址（如 0x401000）
+    std::uint64_t _size;            // 内存大小
+    std::unique_ptr<SegmentDataSource> _dataSource;  // 数据源
+};
+```
+
+### 3.4 镜像的工作流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  1. 文件解析 (FileFormat)                                     │
+│  - 解析 PE/ELF/Mach-O 文件头                                  │
+│  - 提取段表、符号表等信息                                      │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 镜像加载 (Image::load())                                  │
+│  - 读取 ImageBase / 基地址                                    │
+│  - 将文件节(Section) → 内存段(Segment)                        │
+│  - 计算虚拟地址：VA = ImageBase + RVA                         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 内存访问                                                  │
+│  - Decoder 通过虚拟地址读取指令                                │
+│  - 地址 0x401000 → 找到对应 Segment → 读取数据                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.5 不同格式的镜像实现
+
+| 格式 | 镜像类 | 特殊处理 |
+|------|--------|---------|
+| PE | `PeImage` | 处理 DOS/PE 头、节表、BSS |
+| ELF | `ElfImage` | 处理程序头表、节头表、重定位 |
+| Mach-O | `MachOImage` | 处理 Load Commands |
+| Raw | `RawDataImage` | 整个文件作为一个段 |
+
+#### PE 镜像示例
+
+```cpp
+// src/loader/loader/pe/pe_image.cpp:32
+bool PeImage::load()
+{
+    // PE 文件默认加载到 ImageBase（如 0x400000）
+    peFormat->getImageBaseAddress(imageBase);  // 0x400000
+    setBaseAddress(imageBase);
+    
+    // 每个节转换为 Segment
+    // .text RVA=0x1000 -> VA=0x401000
+    // .data RVA=0x2000 -> VA=0x402000
+}
+```
+
+#### ELF 镜像示例
+
+```cpp
+// src/loader/loader/elf/elf_image.cpp:40
+bool ElfImage::load()
+{
+    // ELF 可执行文件：按程序头表(PT_LOAD)加载
+    // ELF 目标文件：模拟加载，按节组织
+    if (getFileFormat()->isObjectFile())
+        loadRelocatableFile();
+    else
+        loadExecutableFile();
+    
+    // 基地址由第一个 LOAD 段决定
+    setBaseAddress(getSegments().front()->getAddress());
+}
+```
+
+### 3.6 镜像 vs FileFormat
+
+| 对比项 | FileFormat | Image |
+|--------|-----------|-------|
+| **职责** | 解析文件结构 | 提供内存视图 |
+| **数据组织** | 按文件偏移 | 按虚拟地址 |
+| **主要用途** | 读取文件元数据 | 运行时内存访问 |
+| **典型操作** | 读取段表、符号表 | 按地址读取字节 |
+
+**简单记忆：**
+- **FileFormat** = 读懂文件格式
+- **Image** = 把文件"装"进内存，准备运行
+
+### 3.7 镜像工厂
 
 ```cpp
 // src/loader/image_factory.cpp
@@ -219,7 +552,7 @@ std::unique_ptr<Image> createImage(
 );
 ```
 
-### 3.2 Image 基类
+### 3.8 Image 基类
 
 ```cpp
 // include/retdec/loader/loader/image.h
@@ -260,7 +593,7 @@ public:
 };
 ```
 
-### 3.3 段 (Segment) 结构
+### 3.9 段 (Segment) 结构
 
 ```cpp
 // src/loader/loader/segment.h
@@ -290,7 +623,7 @@ public:
 };
 ```
 
-### 3.4 各格式镜像加载
+### 3.10 各格式镜像加载
 
 #### PE 镜像加载
 
