@@ -18,6 +18,12 @@
   - Providers 初始化架构
   - 函数识别与符号解析
 
+- **[函数识别机制详解](./function_detection.md)** - RetDec 如何确定某些地址是一个函数
+  - 从文件元数据识别（符号表、导入/导出表、调试信息）
+  - 扫描二进制代码识别（Call 指令、分支跳转）
+  - 静态代码模式匹配（stacofin）
+  - C++ 虚表分析
+
 #### 2.2 Capstone → LLVM IR 转换
 - **[x86 指令翻译详细分析](./capstone2llvmir.md)** - x86 到 LLVM IR 的详细映射
   - 翻译器核心架构
@@ -126,9 +132,10 @@ src/
 
 1. **入门** - 阅读 `retdec-guide-zh.md` 了解整体架构
 2. **加载流程** - 阅读 `binary_loading.md` 理解文件如何被加载
-3. **指令翻译** - 阅读 `capstone2llvmir.md` 和 `capstone2llvmir_architectures.md`
-4. **IR 建模** - 阅读 `x86_modeling.md` 理解数据流分析基础
-5. **端到端** - 阅读 `二进制到LLVM_IR转换流程.md` 了解完整流程
+3. **函数识别** - 阅读 `function_detection.md` 理解函数识别机制
+4. **指令翻译** - 阅读 `capstone2llvmir.md` 和 `capstone2llvmir_architectures.md`
+5. **IR 建模** - 阅读 `x86_modeling.md` 理解数据流分析基础
+6. **端到端** - 阅读 `二进制到LLVM_IR转换流程.md` 了解完整流程
 
 ---
 
