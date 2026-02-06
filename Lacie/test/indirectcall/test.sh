@@ -9,7 +9,7 @@ BUILDS_DIR="$SCRIPT_DIR/builds"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
 # RetDec paths
-RETDEC_ROOT="$SCRIPT_DIR/../../../../build"
+RETDEC_ROOT="$SCRIPT_DIR/../../../build"
 RETDEC_BIN="$RETDEC_ROOT/src/retdec-decompiler/retdec-decompiler"
 RETDEC_SHARE="$RETDEC_ROOT/share/retdec"
 
