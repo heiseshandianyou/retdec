@@ -340,22 +340,46 @@ llvm::CallInst* Decoder::transformToCondCall(
 
 ## 阶段三：重新解析未确定的调用
 
-某些调用在初次解码时无法确定目标（如间接调用、函数指针），`resolvePseudoCalls()` 在主要解码完成后再次尝试解析。
+### 3.1 为什么需要重新解析
+
+在初次解码阶段（`getJumpTargetsFromInstruction`），某些调用目标可能无法立即确定：
+- **间接调用**：目标地址通过寄存器或内存计算得出
+- **前向引用**：目标函数尚未被解码（地址未知）
+- **复杂表达式**：目标地址需要常量传播才能确定
+
+```cpp
+// 示例：间接调用（初次解码时无法确定目标）
+call [eax]        ; eax 的值在静态分析时未知
+call [0x405000]   ; 内存中的值可能是动态写入的
+```
+
+### 3.2 `resolvePseudoCalls()` 详解
+
+`resolvePseudoCalls()` 在主要解码完成后，**第二次遍历**所有伪调用，尝试解析那些初次未确定的目标。
+
+#### 核心逻辑
 
 ```cpp
 // src/bin2llvmir/optimizations/decoder/decoder.cpp:1474-1529
 
 void Decoder::resolvePseudoCalls()
 {
+    // TODO: 理想情况下应该实现不动点算法，反复解析直到稳定
+    // - 相同结果 -> 保持现状
+    // - 无结果 -> 撤销转换
+    // - 新结果 -> 重新转换
+    // 但这实现复杂，涉及撤销操作和状态管理
+
     for (llvm::Function& f : *_module)
     for (llvm::BasicBlock& b : f)
     for (auto i = b.begin(), e = b.end(); i != e;)
     {
+        // 1. 查找伪调用指令
         llvm::CallInst* pseudo = llvm::dyn_cast<llvm::CallInst>(&*i);
         ++i;
         if (pseudo == nullptr) continue;
         
-        // 只处理伪调用
+        // 2. 只处理控制流相关的伪调用
         if (!_c2l->isCallFunctionCall(pseudo) &&
             !_c2l->isReturnFunctionCall(pseudo) &&
             !_c2l->isBranchFunctionCall(pseudo) &&
@@ -364,31 +388,129 @@ void Decoder::resolvePseudoCalls()
             continue;
         }
         
+        // 3. 获取伪调用后的第一条真实指令
+        // 在初次解码时，如果目标已确定，会生成：
+        //   call @_callFunction(addr)  <- 伪调用
+        //   call @real_function()      <- 真实调用（real）
+        //   store i32 %ret, i32* @EAX   <- 返回值存储
         llvm::Instruction* real = pseudo->getNextNode();
         if (real == nullptr) continue;
         ++i;
         
-        // 如果是调用且之前已转换，检查目标是否有效
-        if (_c2l->isCallFunctionCall(pseudo) &&
-            llvm::isa<llvm::CallInst>(real))
+        // 4. 处理 Call 类型的伪调用
+        if (_c2l->isCallFunctionCall(pseudo)
+                && llvm::isa<llvm::CallInst>(real))
         {
+            // 重新计算目标地址
+            // getJumpTarget 会尝试常量传播、查找已解码的函数等
             Address t = getJumpTarget(
-                AsmInstruction::getInstructionAddress(real),
-                pseudo,
-                pseudo->getArgOperand(0));
-            
-            if (t.isUndefined())  // 仍无法解析目标
+                    AsmInstruction::getInstructionAddress(real),
+                    pseudo,
+                    pseudo->getArgOperand(0));
+
+            // 5. 如果仍无法解析，删除之前生成的调用
+            if (t.isUndefined())
             {
                 ++i;
-                // 删除之前生成的调用和返回值存储
+                // 删除返回值存储指令（StoreInst）
                 auto* st = llvm::cast<llvm::StoreInst>(*real->user_begin());
                 st->eraseFromParent();
+                // 删除真实调用指令
                 real->eraseFromParent();
+                // 注意：伪调用本身在 finalizePseudoCalls() 中删除
             }
         }
     }
 }
 ```
+
+#### 关键步骤说明
+
+| 步骤 | 代码 | 说明 |
+|------|------|------|
+| 1 | `dyn_cast<llvm::CallInst>(&*i)` | 遍历所有指令，查找调用指令 |
+| 2 | `isCallFunctionCall(pseudo)` | 判断是否为我们生成的伪调用 |
+| 3 | `pseudo->getNextNode()` | 获取伪调用后的第一条指令 |
+| 4 | `getJumpTarget(...)` | **核心：重新计算调用目标地址** |
+| 5 | `st->eraseFromParent()` | 如果仍无法解析，清理生成的指令 |
+
+### 3.3 `getJumpTarget()` 解析逻辑
+
+`getJumpTarget()` 尝试通过多种方式确定调用目标：
+
+```cpp
+// 伪代码示意
+Address Decoder::getJumpTarget(Address from, CallInst* pseudo, Value* targetVal)
+{
+    // 1. 常量直接解析
+    if (auto* ci = dyn_cast<ConstantInt>(targetVal)) {
+        return ci->getZExtValue();
+    }
+    
+    // 2. 查找已解码的函数
+    for (auto& f : module->functions()) {
+        if (f.getAddress() == computedAddr) {
+            return f.getAddress();
+        }
+    }
+    
+    // 3. 常量传播（尝试计算表达式的值）
+    // 例如：%addr = add i32 0x401000, 16 -> 0x401010
+    
+    // 4. 如果仍无法确定，返回 Undefined
+    return Address::Undefined;
+}
+```
+
+### 3.4 两种处理结果
+
+```
+初次解码时目标未确定
+        │
+        ▼
+┌─────────────────────────────┐
+│ resolvePseudoCalls() 重新解析 │
+└─────────────────────────────┘
+        │
+   ┌────┴────┐
+   ▼         ▼
+能确定目标   仍无法确定
+   │         │
+   ▼         ▼
+保持转换    删除生成的调用
+（有效）    （无效转换回滚）
+```
+
+### 3.5 为什么不是不动点算法
+
+代码注释中提到：
+
+```cpp
+// TODO: fix point algorithm that tries to re-solve all solved and unsolved
+// pseudo calls?
+// - the same result -> ok, nothing
+// - no result -> revert transformation
+// - new result -> new transformation
+// This will not be easy. Can fixpoint even be reached? Reverts, etc. are
+// hard and ugly.
+```
+
+**不动点算法的难点**：
+1. **循环依赖**：A 调用 B，B 调用 A，解析结果可能震荡
+2. **状态管理**：撤销之前的转换涉及大量 IR 修改
+3. **收敛性**：无法保证一定能达到稳定状态
+4. **复杂度**：实现代价高，收益有限
+
+当前实现采用**单次重解析**，在简单场景下已经足够有效。
+
+### 3.6 与 `finalizePseudoCalls()` 的关系
+
+| 函数 | 调用时机 | 作用 |
+|------|---------|------|
+| `resolvePseudoCalls()` | 主要解码完成后 | 重解析未确定的调用，删除无效转换 |
+| `finalizePseudoCalls()` | `resolvePseudoCalls()` 之后 | 删除所有剩余的伪调用及其 setup 代码 |
+
+**注意**：`resolvePseudoCalls()` 删除的是之前生成的**真实调用**（无效时），而 `finalizePseudoCalls()` 删除的是**伪调用本身**（无论是否有效）。
 
 ---
 

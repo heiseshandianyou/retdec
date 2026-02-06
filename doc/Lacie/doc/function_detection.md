@@ -524,7 +524,250 @@ enum class eType {
 
 ---
 
-## 10. 总结
+## 10. 跳转目标的类型判断：函数 vs 基本块
+
+在递归下降解码过程中，当遇到 `call` 或 `jmp` 指令时，RetDec 需要判断目标地址应该是一个**新函数**、**现有函数**还是**基本块**。这是通过 `getOrCreateCallTarget` 和 `getOrCreateBranchTarget` 函数实现的。
+
+### 10.1 判断流程
+
+```
+跳转目标地址 addr
+      │
+      ▼
+┌─────────────────────────────┐
+│ 已有函数在此地址？            │──getFunctionAtAddress(addr)──┐
+│ (如符号表导入的函数)          │                              │
+└─────────────────────────────┘                              │
+      │                                                      │
+      ▼ 是                                                   │
+┌─────────────────────────────┐                              │
+│    返回现有函数              │◄─────────────────────────────┘
+└─────────────────────────────┘
+      │
+      ▼ 否
+┌─────────────────────────────┐
+│ 已有基本块在此地址？          │──getBasicBlockAtAddress(addr)─┐
+└─────────────────────────────┘                               │
+      │                                                       │
+      ▼ 是                                                    │
+┌─────────────────────────────┐                               │
+│   返回现有基本块             │◄──────────────────────────────┘
+└─────────────────────────────┘
+      │
+      ▼ 否
+┌─────────────────────────────┐
+│ 目标在某基本块内部？          │──getBasicBlockContainingAddress(addr)─┐
+│ (且在同一函数内)              │                                        │
+└─────────────────────────────┘                                        │
+      │                                                                │
+      ▼ 是                                                             │
+┌─────────────────────────────┐                                        │
+│ 拆分现有基本块               │◄───────────────────────────────────────┘
+│ 返回新基本块                 │
+└─────────────────────────────┘
+      │
+      ▼ 否
+┌─────────────────────────────┐
+│ 目标在某函数范围内？          │──getFunctionContainingAddress(addr)─┐
+└─────────────────────────────┘                                      │
+      │                                                              │
+      ▼ 是                                                           │
+┌─────────────────────────────┐                                      │
+│ 创建新基本块                 │◄─────────────────────────────────────┘
+│ 附加到现有函数               │
+└─────────────────────────────┘
+      │
+      ▼ 否
+┌─────────────────────────────┐
+│   创建新函数！               │
+│ (完全独立的入口点)           │
+└─────────────────────────────┘
+```
+
+### 10.2 Call 指令的判断逻辑
+
+`call` 指令倾向于创建函数（激进策略）：
+
+```cpp
+// src/bin2llvmir/optimizations/decoder/ir_modifications.cpp:186
+
+void Decoder::getOrCreateCallTarget(
+        common::Address addr,
+        llvm::Function*& tFnc,
+        llvm::BasicBlock*& tBb)
+{
+    tBb = nullptr;
+    tFnc = nullptr;
+
+    // 优先级1: 已有函数
+    if (auto* f = getFunctionAtAddress(addr)) {
+        tFnc = f;
+        tBb = tFnc->empty() ? nullptr : &tFnc->front();
+    }
+    // 优先级2: 尝试拆分函数（call 更激进）
+    else if (auto* f = splitFunctionOn(addr)) {
+        tFnc = f;
+        tBb = tFnc->empty() ? nullptr : &tFnc->front();
+    }
+    // 优先级3: 已有基本块
+    else if (auto* bb = getBasicBlockAtAddress(addr)) {
+        tBb = bb;
+    }
+    // 优先级4: 在现有函数内
+    else if (getFunctionContainingAddress(addr)) {
+        auto* bb = getBasicBlockBeforeAddress(addr);
+        tBb = createBasicBlock(addr, bb->getParent(), bb);
+    }
+    // 优先级5: 创建新函数
+    else {
+        tFnc = createFunction(addr);
+        tBb = tFnc && !tFnc->empty() ? &tFnc->front() : nullptr;
+    }
+}
+```
+
+### 10.3 Jmp 指令的判断逻辑
+
+`jmp` 指令倾向于在当前函数内创建基本块（保守策略）：
+
+```cpp
+// src/bin2llvmir/optimizations/decoder/ir_modifications.cpp:237
+
+void Decoder::getOrCreateBranchTarget(
+        common::Address addr,
+        llvm::BasicBlock*& tBb,
+        llvm::Function*& tFnc,
+        llvm::Instruction* from)
+{
+    auto* fromFnc = from->getFunction();
+    tBb = nullptr;
+    tFnc = nullptr;
+
+    // 优先级1: 已有基本块
+    if (auto* bb = getBasicBlockAtAddress(addr)) {
+        tBb = bb;
+    }
+    // 优先级2: 在现有基本块内
+    else if (getBasicBlockContainingAddress(addr)) {
+        auto ai = AsmInstruction(_module, addr);
+        if (ai.isInvalid()) {
+            return;  // 无效地址
+        }
+        else if (ai.getFunction() == fromFnc) {
+            // 同一函数内 -> 拆分基本块
+            tBb = ai.makeStart();
+            addBasicBlock(addr, tBb);
+        }
+        else {
+            // 不同函数 -> 暂不处理
+            return;
+        }
+    }
+    // 优先级3: 已有函数声明
+    else if (auto* targetFnc = getFunctionAtAddress(addr)) {
+        tFnc = targetFnc;
+    }
+    // 优先级4: 在某函数范围内
+    else if (auto* bb = getBasicBlockBeforeAddress(addr)) {
+        tBb = createBasicBlock(addr, bb->getParent(), bb);
+    }
+    // 优先级5: 创建新函数
+    else {
+        tFnc = createFunction(addr);
+        tBb = tFnc && !tFnc->empty() ? &tFnc->front() : nullptr;
+    }
+    
+    // 跨函数跳转处理
+    if (tBb && tBb->getParent() != fromFnc && !tFnc) {
+        tFnc = splitFunctionOn(addr);
+        tBb = tFnc && !tFnc->empty() ? &tFnc->front() : tBb;
+    }
+}
+```
+
+### 10.4 判断依据对比
+
+| 判断条件 | `call` 指令处理 | `jmp` 指令处理 |
+|---------|----------------|---------------|
+| **已有函数** | 直接使用 | 转为调用该函数 |
+| **已有基本块** | 作为函数调用 | 作为基本块跳转 |
+| **在基本块内** | 拆分函数 | 拆分基本块（同函数）或忽略（跨函数） |
+| **在函数范围内** | 创建新基本块 | 创建新基本块 |
+| **完全未知** | **创建新函数** | **创建新函数** |
+| **函数拆分** | 激进（优先尝试） | 保守（最后手段） |
+
+### 10.5 函数拆分判断
+
+当目标地址位于现有函数中间时，需要判断是否允许拆分：
+
+```cpp
+// src/bin2llvmir/optimizations/decoder/ir_modifications.cpp:317
+
+bool Decoder::canSplitFunctionOn(llvm::BasicBlock* bb)
+{
+    for (auto* u : bb->users()) {
+        // 所有使用者必须是无条件跳转
+        auto* br = dyn_cast<BranchInst>(u);
+        if (br == nullptr || br->isConditional()) {
+            return false;
+        }
+        
+        // 跳转不能来自紧邻的前一条指令
+        // 避免正常执行流被误判
+        AsmInstruction brAsm(br);
+        AsmInstruction bbAsm(bb);
+        if (brAsm.getEndAddress() == bbAsm.getAddress()) {
+            return false;
+        }
+    }
+    return true;
+}
+```
+
+### 10.6 实际示例
+
+**示例1：Call 识别为新函数**
+```asm
+main:
+    call 0x402000      ; 调用未知地址
+    ret
+
+; RetDec 处理:
+; 1. 0x402000 无已知函数
+; 2. 不在任何基本块/函数内
+; 3. 创建新函数 func_402000
+```
+
+**示例2：Jmp 识别为基本块**
+```asm
+main:
+    jmp loop_start     ; 跳转到同一函数内
+    ...
+loop_start:
+    ...
+    jmp loop_start     ; 循环
+
+; RetDec 处理:
+; 1. loop_start 无已知函数/基本块
+; 2. 在 main 函数范围内
+; 3. 创建新基本块（属于 main）
+```
+
+**示例3：Jmp 识别为尾调用**
+```asm
+func_a:
+    ...
+    jmp func_b         ; 跳转到已知函数
+
+; RetDec 处理:
+; 1. func_b 是已知函数
+; 2. 识别为尾调用优化
+; 3. 转换为 call func_b + ret
+```
+
+---
+
+## 11. 总结
 
 RetDec 通过以下方式确定某些地址是一个函数：
 
