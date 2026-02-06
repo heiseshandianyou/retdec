@@ -466,6 +466,14 @@ bool decompile(retdec::config::Config& config, std::string* outString)
 
 	Log::phase("Initialization");
 	auto& passRegistry = initializeLlvmPasses();
+	
+	// Debug: Print number of passes in config
+	std::cerr << "DEBUG: Number of llvmPasses in config: " 
+	          << config.parameters.llvmPasses.size() << std::endl;
+	for (const auto& p : config.parameters.llvmPasses)
+	{
+		std::cerr << "DEBUG: Pass: " << p << std::endl;
+	}
 
 	// limitMaximalMemoryIfRequested(params);
 	// PrintAfterAll = true;

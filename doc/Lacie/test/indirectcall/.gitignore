@@ -1,0 +1,9 @@
+# Build artifacts
+builds/
+output/
+
+# Generated files
+*.ll
+*.bc
+*.o
+*.log

@@ -4,6 +4,7 @@
  * @copyright (c) 2017 Avast Software, licensed under the MIT license
  */
 #include <fstream>
+#include <iostream>
 
 #include <rapidjson/error/en.h>
 #include <rapidjson/prettywriter.h>
@@ -184,8 +185,11 @@ void Config::readJsonString(const std::string& json)
 	*this = Config();
 
 	auto params = root.FindMember(JSON_parameters);
+	std::cerr << "DEBUG config.cpp: JSON_parameters = " << JSON_parameters << std::endl;
+	std::cerr << "DEBUG config.cpp: params found = " << (params != root.MemberEnd() ? "yes" : "no") << std::endl;
 	if (params != root.MemberEnd())
 	{
+		std::cerr << "DEBUG config.cpp: calling parameters.deserialize" << std::endl;
 		parameters.deserialize(params->value);
 	}
 

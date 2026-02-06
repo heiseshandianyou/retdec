@@ -142,12 +142,12 @@ void ProgramOptions::load()
 				);
 			}
 
+
 			// TODO:
 			// This redefines all the params from the loaded config.
 			// Maybe we should do some kind of merge.
 			// But it is hard to know what was defined, what was not,
 			// and which value to prefer.
-			config.parameters = backup;
 		}
 		++i;
 	}

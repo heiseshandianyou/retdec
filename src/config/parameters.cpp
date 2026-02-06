@@ -10,6 +10,8 @@
 #include "retdec/config/parameters.h"
 #include "retdec/serdes/address.h"
 #include "retdec/serdes/std.h"
+#include <iostream>
+
 #include "retdec/utils/filesystem.h"
 
 namespace {
