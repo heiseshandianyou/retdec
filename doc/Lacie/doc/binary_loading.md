@@ -1078,9 +1078,292 @@ void detectEntryPoint(Config* config, FileImage* image) {
 
 ---
 
-## 7. 数据提取
+## 7. RTTI 信息处理
 
-### 7.1 字符串提取
+RetDec 有一个专门的模块 `rtti-finder` 用于处理 C++ RTTI（Run-Time Type Information）信息，支持 GCC/Clang 和 MSVC 两种格式。
+
+### 7.1 RTTI 处理流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. 虚表发现 (vtable_finder.cpp)                                 │
+│  - 扫描数据段寻找可能的虚表结构                                    │
+│  - 特征：连续的有效代码指针                                        │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. RTTI 解析                                                    │
+│  - GCC: parseGccRtti()    → 解析 type_info 结构                 │
+│  - MSVC: parseMsvcRtti()  → 解析 RTTI Complete Object Locator   │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  3. 信息提取                                                     │
+│  - 类名 (demangled)                                              │
+│  - 继承关系 (基类信息)                                            │
+│  - 虚函数地址列表                                                 │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  4. 应用                                                         │
+│  - 函数识别 (虚表中的函数指针)                                     │
+│  - 类层次结构重建                                                 │
+│  - 变量类型推断                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 支持的 RTTI 格式
+
+| 编译器 | 支持情况 | 主要结构 |
+|--------|---------|---------|
+| **GCC/Clang** | ✅ 完整支持 | `type_info`, `si_class_type_info`, `vmi_class_type_info` |
+| **MSVC** | ✅ 完整支持 | `RTTITypeDescriptor`, `RTTIClassHierarchyDescriptor`, `RTTIBaseClassDescriptor` |
+
+### 7.3 核心组件
+
+#### RTTI Finder 入口
+
+```cpp
+// src/rtti-finder/rtti_finder.cpp
+class RttiFinder {
+public:
+    // 查找 GCC/Clang RTTI
+    void findGcc(const retdec::loader::Image* img);
+    
+    // 查找 MSVC RTTI
+    void findMsvc(const retdec::loader::Image* img);
+    
+    // 获取解析后的虚表
+    const VtablesGcc& getVtablesGcc() const;
+    const VtablesMsvc& getVtablesMsvc() const;
+    
+    // 获取 RTTI 信息
+    const RttiGcc& getRttiGcc() const;
+    const RttiMsvc& getRttiMsvc() const;
+};
+```
+
+#### GCC RTTI 解析
+
+```cpp
+// src/rtti-finder/rtti/rtti_gcc_parser.cpp
+std::shared_ptr<ClassTypeInfo> parseGccRtti(
+    const retdec::loader::Image* img,
+    RttiGcc& rttis,
+    Address rttiAddr,
+    std::set<Address>& visited)
+{
+    // 读取 vptr (指向 type_info 虚表)
+    std::uint64_t vptrAddr = 0;
+    img->getWord(addr, vptrAddr);
+    addr += wordSize;
+    
+    // 读取类型名称
+    std::uint64_t nameAddr = 0;
+    img->getWord(addr, nameAddr);
+    std::string name;
+    img->getNTBS(nameAddr, name);  // 读取 C 字符串
+    
+    // 解析基类信息
+    // - SiClassTypeInfo: 单继承
+    // - VmiClassTypeInfo: 多继承（虚拟内存继承）
+}
+```
+
+#### MSVC RTTI 解析
+
+```cpp
+// src/rtti-finder/rtti/rtti_msvc_parser.cpp
+RTTICompleteObjectLocator* parseMsvcRtti(
+    const retdec::loader::Image* img,
+    RttiMsvc& rttis,
+    Address colAddr)
+{
+    // 解析 RTTI Complete Object Locator
+    // 包含：signature, offset, cdOffset, 
+    //       typeDescriptorAddr, classDescriptorAddr, objectBase
+    
+    // 解析 Type Descriptor → 获取类名
+    // .?AVClassName@@ (decorated name)
+    
+    // 解析 Class Hierarchy Descriptor → 获取继承层次
+}
+```
+
+### 7.4 虚表查找算法
+
+```cpp
+// src/rtti-finder/vtable/vtable_finder.cpp
+
+void findPossibleVtables(
+    const retdec::loader::Image* img,
+    std::set<Address>& possibleVtables,
+    bool gcc)
+{
+    for (auto& seg : img->getSegments())
+    {
+        // 只在数据段中查找
+        if (!seg->getSecSeg()->isSomeData())
+            continue;
+        
+        // 扫描段内所有可能的虚表
+        // 特征：连续的有效代码指针
+        while (addr + wordSz < end)
+        {
+            // GCC 虚表：第一个条目为 0（偏移量）
+            // MSVC 虚表：直接开始函数指针
+            
+            if (img->isPointer(item1) && img->isPointer(item2))
+            {
+                possibleVtables.insert(item2);
+            }
+        }
+    }
+}
+
+// 填充虚表条目
+bool fillVtable(const retdec::loader::Image* img, 
+                Address a, Vtable& vt)
+{
+    // 连续读取函数指针直到非指针或重复
+    while (img->isPointer(a, &ptr))
+    {
+        // 验证指针指向代码段
+        auto* seg = img->getSegmentFromAddress(ptr);
+        if (!seg || !seg->getSecSeg()->isSomeCode())
+            break;
+        
+        vt.items.emplace(VtableItem(a, ptr));
+        a += bytesPerWord;
+    }
+}
+```
+
+### 7.5 RTTI 在反编译中的应用
+
+#### A. 函数识别（通过虚表）
+
+```cpp
+// src/bin2llvmir/optimizations/decoder/decoder_init.cpp:991
+void Decoder::initVtables()
+{
+    // 收集 GCC 和 MSVC 风格的虚表
+    for (auto& p : _image->getRtti().getVtablesGcc())
+        vtable.push_back(&p.second);
+    for (auto& p : _image->getRtti().getVtablesMsvc())
+        vtable.push_back(&p.second);
+    
+    // 从虚表中提取函数指针
+    for (auto* p : vtable)
+    {
+        for (auto& item : vt.items)
+        {
+            // 虚表中的每个条目都是一个函数地址
+            if (auto* jt = _jumpTargets.push(
+                    item.functionAddress,
+                    JumpTarget::eType::VTABLE))
+            {
+                auto* nf = createFunction(jt->getAddress());
+            }
+        }
+    }
+}
+```
+
+#### B. 类层次结构分析
+
+```cpp
+// src/bin2llvmir/optimizations/class_hierarchy/hierarchy.cpp
+void ClassHierarchy::analyze()
+{
+    // 使用 RTTI 信息重建类继承关系
+    // - 基类指针
+    // - 多继承布局
+    // - 虚继承关系
+}
+```
+
+#### C. 类型推断
+
+```cpp
+// 通过虚表指针识别对象类型
+void* obj = ...;
+void** vptr = *(void***)obj;  // 读取虚表指针
+
+// 查找对应的 RTTI 信息
+auto* vtable = rttiFinder.getVtable((Address)vptr);
+if (vtable && vtable->rtti)
+{
+    std::string className = vtable->rtti->name;
+    // 现在知道 obj 是 className 类型
+}
+```
+
+### 7.6 虚表数据结构示例
+
+#### GCC 虚表结构
+```
+地址        内容                    说明
+0x403000    0x00000000              (偏移量，GCC)
+0x403004    0x402000    ─┐          RTTI 信息指针 → type_info
+0x403008    0x401000    ─┼──>      虚函数 1 (method1)
+0x40300C    0x401010    ─┤          虚函数 2 (method2)
+0x403010    0x401020    ─┘          虚函数 3 (method3)
+```
+
+#### MSVC 虚表结构
+```
+地址        内容                    说明
+0x403000    0x402000    ───>        RTTI Complete Object Locator
+0x403004    0x401000               虚函数 1
+0x403008    0x401010               虚函数 2
+0x40300C    0x401020               虚函数 3
+```
+
+### 7.7 FileImage 中的 RTTI
+
+```cpp
+// src/bin2llvmir/providers/fileimage.cpp
+class FileImage {
+private:
+    retdec::rtti_finder::RttiFinder _rtti;
+    
+public:
+    void initRtti(Config* config)
+    {
+        if (config->getConfig().tools.isMsvc())
+        {
+            _rtti.findMsvc(getImage());
+        }
+        else
+        {
+            _rtti.findGcc(getImage());
+        }
+    }
+    
+    const RttiFinder& getRtti() const
+    {
+        return _rtti;
+    }
+};
+```
+
+### 7.8 限制与注意事项
+
+| 限制 | 说明 |
+|------|------|
+| 编译选项 | 需要二进制文件包含完整的 RTTI 信息（编译时未使用 `-fno-rtti`） |
+| 混淆代码 | 对于严重混淆或剥离的代码，RTTI 可能被破坏 |
+| 虚表完整性 | 如果虚表被修改或部分损坏，解析可能失败 |
+
+---
+
+## 8. 数据提取
+
+### 8.1 字符串提取
 
 ```cpp
 // src/fileformat/types/strings/string.cpp
@@ -1112,7 +1395,7 @@ void FileFormat::getStrings(std::set<String>& result, std::size_t minLength) {
 }
 ```
 
-### 7.2 资源提取 (PE)
+### 8.2 资源提取 (PE)
 
 ```cpp
 // src/fileformat/types/resource_table/resource_table.cpp
@@ -1138,7 +1421,7 @@ public:
 
 ---
 
-## 8. 初始化时序图
+## 9. 初始化时序图
 
 ```
 User
@@ -1180,9 +1463,10 @@ User
         Output.ll
 ```
 
+
 ---
 
-## 9. 参考文件
+## 10. 参考文件
 
 | 组件 | 关键文件 |
 |------|----------|
@@ -1196,3 +1480,9 @@ User
 | Provider 初始化 | `src/bin2llvmir/optimizations/provider_init/provider_init.cpp` |
 | FileImage Provider | `src/bin2llvmir/providers/fileimage.cpp` |
 | 解码器 | `src/bin2llvmir/optimizations/decoder/decoder.cpp` |
+| **RTTI Finder** | `src/rtti-finder/rtti_finder.cpp` |
+| **GCC RTTI 解析** | `src/rtti-finder/rtti/rtti_gcc_parser.cpp` |
+| **MSVC RTTI 解析** | `src/rtti-finder/rtti/rtti_msvc_parser.cpp` |
+| **虚表查找** | `src/rtti-finder/vtable/vtable_finder.cpp` |
+| 类层次分析 | `src/bin2llvmir/optimizations/class_hierarchy/hierarchy.cpp` |
+| 虚表函数识别 | `src/bin2llvmir/optimizations/decoder/decoder_init.cpp` |
