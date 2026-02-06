@@ -120,6 +120,7 @@ bool Decoder::run()
 	}
 
 	resolvePseudoCalls();
+	preserveIndirectCalls();
 	patternsRecognize();
 	finalizePseudoCalls();
 
@@ -1520,9 +1521,12 @@ void Decoder::resolvePseudoCalls()
 			if (t.isUndefined())
 			{
 				++i;
-				auto* st = llvm::cast<llvm::StoreInst>(*real->user_begin());
-				st->eraseFromParent();
-				real->eraseFromParent();
+				// Indirect call target not resolved.
+				// Leave it for preserveIndirectCalls() to handle.
+				// Do not delete here - we want to keep the call for later analysis.
+				LOG << "\t\t" << "Unresolved call @ " 
+						<< AsmInstruction::getInstructionAddress(real)
+						<< ", will preserve for points-to analysis" << std::endl;
 			}
 		}
 	}
@@ -1548,6 +1552,13 @@ void Decoder::finalizePseudoCalls()
 
 		if (!icf && !irf && !ibf && !icbf)
 		{
+			continue;
+		}
+
+		// Skip indirect calls - they are preserved for points-to analysis.
+		if (icf && isIndirectCallPseudo(pseudo))
+		{
+			cleanupIndirectCallSetup(pseudo);
 			continue;
 		}
 
@@ -1634,6 +1645,171 @@ void Decoder::finalizePseudoCalls()
 			}
 		}
 	}
+}
+
+/**
+ * @brief Preserve indirect call pseudo calls for points-to analysis.
+ * 
+ * This function is called after resolvePseudoCalls(). It processes call
+ * pseudo calls whose targets could not be resolved, marks them as indirect
+ * calls, and preserves them for later points-to analysis.
+ */
+void Decoder::preserveIndirectCalls()
+{
+	LOG << "\n" << "preserveIndirectCalls():" << std::endl;
+	
+	unsigned preserved = 0;
+	
+	for (llvm::Function& f : *_module)
+	for (llvm::BasicBlock& b : f)
+	for (auto i = b.begin(), e = b.end(); i != e;)
+	{
+		llvm::CallInst* pseudo = llvm::dyn_cast<llvm::CallInst>(&*i);
+		++i;
+		
+		if (pseudo == nullptr) continue;
+		
+		// Only handle call pseudo calls
+		if (!_c2l->isCallFunctionCall(pseudo)) continue;
+		
+		// Check if there's a real call after it
+		llvm::Instruction* real = pseudo->getNextNode();
+		if (real == nullptr) continue;
+		
+		// If already transformed to real call, skip (target was resolved)
+		if (llvm::isa<llvm::CallInst>(real)) continue;
+		
+		// This is an unresolved indirect call
+		// Mark it with metadata
+		llvm::MDNode* meta = llvm::MDNode::get(
+			pseudo->getContext(),
+			llvm::MDString::get(pseudo->getContext(), "indirect_call")
+		);
+		pseudo->setMetadata("retdec.call_type", meta);
+		
+		// Store target operand in metadata for easy access
+		llvm::Value* targetVal = pseudo->getArgOperand(0);
+		if (targetVal)
+		{
+			llvm::MDNode* targetMeta = llvm::MDNode::get(
+				pseudo->getContext(),
+				llvm::ValueAsMetadata::get(targetVal)
+			);
+			pseudo->setMetadata("retdec.indirect_target", targetMeta);
+		}
+		
+		++preserved;
+		LOG << "\t[+] Preserved indirect call @ " 
+			<< AsmInstruction::getInstructionAddress(pseudo) << std::endl;
+	}
+	
+	LOG << "\tTotal preserved: " << preserved << std::endl;
+}
+
+/**
+ * @brief Check if a call is a preserved indirect call pseudo call.
+ */
+bool Decoder::isIndirectCallPseudo(llvm::CallInst* call) const
+{
+	if (call == nullptr) return false;
+	
+	if (auto* meta = call->getMetadata("retdec.call_type"))
+	{
+		if (meta->getNumOperands() > 0)
+		{
+			if (auto* mdStr = llvm::dyn_cast<llvm::MDString>(meta->getOperand(0)))
+			{
+				return mdStr->getString() == "indirect_call";
+			}
+		}
+	}
+	return false;
+}
+
+/**
+ * @brief Clean up setup instructions for indirect calls but keep the pseudo call.
+ */
+void Decoder::cleanupIndirectCallSetup(llvm::CallInst* pseudo)
+{
+	llvm::Instruction* it = pseudo->getPrevNode();
+	
+	while (it)
+	{
+		if (AsmInstruction::isLlvmToAsmInstruction(it))
+		{
+			break;
+		}
+		
+		auto* inst = it;
+		it = it->getPrevNode();
+		
+		// Only delete stack-related setup (return address storage)
+		if (auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+		{
+			if (_abi->isStackPointerRegister(st->getPointerOperand()) ||
+				llvm::isa<llvm::ConstantInt>(st->getValueOperand()))
+			{
+				st->eraseFromParent();
+				continue;
+			}
+		}
+		
+		// Delete other void instructions with no uses
+		if (inst->use_empty() && inst->getType()->isVoidTy())
+		{
+			inst->eraseFromParent();
+		}
+	}
+}
+
+/**
+ * @brief Get all preserved indirect calls in the module.
+ */
+std::vector<llvm::CallInst*> Decoder::getIndirectCalls()
+{
+	std::vector<llvm::CallInst*> result;
+	
+	for (auto& f : *_module)
+	{
+		for (auto& b : f)
+		{
+			for (auto& i : b)
+			{
+				if (auto* call = llvm::dyn_cast<llvm::CallInst>(&i))
+				{
+					if (isIndirectCallPseudo(call))
+					{
+						result.push_back(call);
+					}
+				}
+			}
+		}
+	}
+	
+	return result;
+}
+
+/**
+ * @brief Get the target value of an indirect call.
+ */
+llvm::Value* Decoder::getIndirectCallTarget(llvm::CallInst* call) const
+{
+	if (!isIndirectCallPseudo(call)) return nullptr;
+	
+	// Try metadata first
+	if (auto* meta = call->getMetadata("retdec.indirect_target"))
+	{
+		if (meta->getNumOperands() > 0)
+		{
+			if (auto* vmd = llvm::dyn_cast<llvm::ValueAsMetadata>(meta->getOperand(0)))
+			{
+				return vmd->getValue();
+			}
+		}
+	}
+	
+	// Fallback to operand
+	return call->getArgOperand(0);
 }
 
 } // namespace bin2llvmir

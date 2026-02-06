@@ -129,6 +129,14 @@ class Decoder : public llvm::ModulePass
 		void resolvePseudoCalls();
 		void finalizePseudoCalls();
 
+		// Indirect call handling.
+		//
+		void preserveIndirectCalls();
+		void cleanupIndirectCallSetup(llvm::CallInst* pseudo);
+		bool isIndirectCallPseudo(llvm::CallInst* call) const;
+		std::vector<llvm::CallInst*> getIndirectCalls();
+		llvm::Value* getIndirectCallTarget(llvm::CallInst* call) const;
+
 	// Basic block related methods.
 	//
 	private:
