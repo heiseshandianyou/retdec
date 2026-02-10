@@ -1,0 +1,16 @@
+{
+    "decompParams": {
+        "verboseOut": true,
+        "outputFormat": "plain",
+        "keepAllFuncs": true,
+        "outputLlFile": "",
+        "ordinalNumDirectory": "",
+        "staticSignPaths": [],
+        "llvmPasses" : [
+            "retdec-provider-init",
+            "retdec-decoder",
+            "verify",
+            "retdec-write-ll"
+        ]
+    }
+}

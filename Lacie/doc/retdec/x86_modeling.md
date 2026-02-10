@@ -2,6 +2,8 @@
 
 本文档详细描述 RetDec 如何将 x86 汇编代码建模为 LLVM IR，特别关注数据流分析的建模细节。
 
+> ⚠️ **重要更正**: 本文档之前版本错误地描述了内存访问使用 `getelementptr` 指令。实际上，`src/capstone2llvmir/` 使用 `inttoptr` + `load`/`store` 模式进行内存访问，不使用 GEP 指令。
+
 ## 1. 整体架构
 
 ```
@@ -21,7 +23,7 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                         LLVM IR 建模                              │
 │  - 寄存器 → 全局变量 (@eax, @ebx, @eflags)                        │
-│  - 内存 → 全局变量 @mem + getelementptr                           │
+│  - 内存 → inttoptr + load/store（扁平地址空间）                           │
 │  - 指令 → LLVM IR 指令序列                                        │
 │  - 控制流 → 伪函数调用 + BranchInst                               │
 └─────────────────────────────────────────────────────────────────┘
@@ -144,7 +146,9 @@ StoreInst* storeRegister(uint32_t r, Value* val, IRBuilder<>& irb);
 x86 内存被建模为单一全局字节数组：
 
 ```llvm
-@mem = global [4294967296 x i8] zeroinitializer  ; 4GB 地址空间
+; 注意：capstone2llvmir 不使用全局内存数组
+; 内存访问通过 inttoptr 直接转换地址为指针
+; 不同段使用不同的地址空间（LLVM addrspace）区分
 ```
 
 **内存访问转换：**
@@ -155,10 +159,9 @@ mov eax, [0x1000]      ; 从地址 0x1000 读取 32 位
 ```
 
 ```llvm
-; LLVM IR
-%addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem, i64 0, i64 4096
-%ptr = bitcast i8* %addr to i32*
-%eax = load i32, i32* %ptr
+; LLVM IR（实际生成代码）
+%addr = inttoptr i32 4096 to i32*
+%eax = load i32, i32* %addr
 store i32 %eax, i32* @eax
 ```
 
@@ -173,18 +176,16 @@ mov eax, [ebx + ecx*4 + 8]
 ```
 
 ```llvm
-; LLVM IR 生成过程
+; LLVM IR 实际生成代码（capstone2llvmir/x86/x86.cpp:978-1035）
 %ebx_val = load i32, i32* @ebx
 %ecx_val = load i32, i32* @ecx
 %scale = mul i32 %ecx_val, 4           ; index * scale
 %base_index = add i32 %ebx_val, %scale ; base + index*scale
 %final_addr = add i32 %base_index, 8   ; + displacement
 
-; 符号扩展到 64 位用于 GEP
-%addr_64 = zext i32 %final_addr to i64
-%mem_ptr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem, i64 0, i64 %addr_64
-%val_ptr = bitcast i8* %mem_ptr to i32*
-%val = load i32, i32* %val_ptr
+; ❌ 不使用 GEP！使用 inttoptr
+%ptr = inttoptr i32 %final_addr to i32*
+%val = load i32, i32* %ptr
 store i32 %val, i32* @eax
 ```
 
@@ -212,8 +213,8 @@ mov eax, fs:[0x30]     ; 访问 FS 段的 TLS 数据
 ```
 
 ```llvm
-%addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem_fs, i64 0, i64 48
-%ptr = bitcast i8* %addr to i32*
+; 使用 inttoptr，非 GEP
+%ptr = inttoptr i32 48 to i32*, addrspace(257)  ; FS 段地址空间
 %val = load i32, i32* %ptr
 ```
 
@@ -460,9 +461,8 @@ push eax
 %esp_new = sub i32 %esp_old, 4
 store i32 %esp_new, i32* @esp
 
-; 2. 存储数据到栈顶
-%addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem_ss, i64 0, i64 %esp_new
-%ptr = bitcast i8* %addr to i32*
+; 2. 存储数据到栈顶（使用 inttoptr，非 GEP）
+%ptr = inttoptr i32 %esp_new to i32*, addrspace(258)  ; SS 段
 %eax_val = load i32, i32* @eax
 store i32 %eax_val, i32* %ptr
 ```
@@ -475,10 +475,9 @@ pop eax
 ```
 
 ```llvm
-; 1. 从栈顶读取数据
+; 1. 从栈顶读取数据（使用 inttoptr，非 GEP）
 %esp_old = load i32, i32* @esp
-%addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem_ss, i64 0, i64 %esp_old
-%ptr = bitcast i8* %addr to i32*
+%ptr = inttoptr i32 %esp_old to i32*, addrspace(258)  ; SS 段
 %val = load i32, i32* %ptr
 store i32 %val, i32* @eax
 
@@ -514,13 +513,12 @@ call 0x401000
 ```
 
 ```llvm
-; 1. 保存返回地址到栈
+; 1. 保存返回地址到栈（使用 inttoptr，非 GEP）
 %esp_old = load i32, i32* @esp
 %esp_new = sub i32 %esp_old, 4
 store i32 %esp_new, i32* @esp
 %ret_addr = <next_instruction_address>
-%addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem_ss, i64 0, i64 %esp_new
-%ptr = bitcast i8* %addr to i32*
+%ptr = inttoptr i32 %esp_new to i32*, addrspace(258)  ; SS 段
 store i32 %ret_addr, i32* %ptr
 
 ; 2. 生成伪调用函数（用于控制流分析）
@@ -538,10 +536,9 @@ ret
 ```
 
 ```llvm
-; 1. 从栈顶读取返回地址
+; 1. 从栈顶读取返回地址（使用 inttoptr，非 GEP）
 %esp_old = load i32, i32* @esp
-%addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem_ss, i64 0, i64 %esp_old
-%ptr = bitcast i8* %addr to i32*
+%ptr = inttoptr i32 %esp_old to i32*, addrspace(258)  ; SS 段
 %ret_addr = load i32, i32* %ptr
 
 ; 2. 恢复栈指针
@@ -574,15 +571,15 @@ loop_header:
     br i1 %cond, label %loop_end, label %loop_body
 
 loop_body:
-    ; 1. 从源地址读取 (ESI)
+    ; 1. 从源地址读取 (ESI) - 使用 inttoptr，非 GEP
     %esi = load i32, i32* @esi
-    %src_addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem, i64 0, i64 %esi
-    %byte = load i8, i8* %src_addr
+    %src_ptr = inttoptr i32 %esi to i8*
+    %byte = load i8, i8* %src_ptr
     
-    ; 2. 写入目标地址 (EDI)
+    ; 2. 写入目标地址 (EDI) - 使用 inttoptr，非 GEP
     %edi = load i32, i32* @edi
-    %dst_addr = getelementptr [4294967296 x i8], [4294967296 x i8]* @mem_es, i64 0, i64 %edi
-    store i8 %byte, i8* %dst_addr
+    %dst_ptr = inttoptr i32 %edi to i8*, addrspace(256)  ; ES 段
+    store i8 %byte, i8* %dst_ptr
     
     ; 3. 更新指针 (根据 DF 标志决定方向)
     %df = load i1, i1* @df
@@ -655,7 +652,7 @@ fall_through:
 | 模式 | LLVM IR 特征 | 分析要点 |
 |------|-------------|----------|
 | 寄存器传播 | `load` → `store` | 追踪 @reg 全局变量 |
-| 内存传播 | `gep` → `load`/`store` | 分析地址计算表达式 |
+| 内存传播 | `inttoptr` → `load`/`store` | 分析地址计算表达式 |
 | 常量传播 | `store i32 42` | 直接提取常量值 |
 | 栈帧访问 | `@mem_ss` + `@ebp`/`@esp` | 识别局部变量偏移 |
 | 函数参数 | `@mem_ss` + 偏移 | 分析 CALL 前的 PUSH |

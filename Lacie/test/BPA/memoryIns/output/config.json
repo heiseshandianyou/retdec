@@ -1,0 +1,16 @@
+{
+    "decompParams": {
+        "verboseOut": true,
+        "outputFormat": "plain",
+        "keepAllFuncs": true,
+        "outputLlFile": "/home/lacie/project/retdec1/retdec/Lacie/test/BPA/memoryIns/output/test_memory_access.ll",
+        "ordinalNumDirectory": "/home/lacie/project/retdec1/retdec/Lacie/test/BPA/memoryIns/../../../../build/share/retdec/support/ordinals/",
+        "staticSignPaths": ["/home/lacie/project/retdec1/retdec/Lacie/test/BPA/memoryIns/../../../../build/share/retdec/support/generic/yara_patterns/static-code/"],
+        "llvmPasses" : [
+            "retdec-provider-init",
+            "retdec-decoder",
+            "verify",
+            "retdec-write-ll"
+        ]
+    }
+}

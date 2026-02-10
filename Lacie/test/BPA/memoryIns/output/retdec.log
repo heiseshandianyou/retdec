@@ -1,0 +1,15 @@
+DEBUG config.cpp: JSON_parameters = decompParams
+DEBUG config.cpp: params found = yes
+DEBUG config.cpp: calling parameters.deserialize
+Running phase: Unpacking ( 0.01s )
+No matching plugins found for 'GCC 11.4.0'
+Running phase: Initialization ( 0.02s )
+DEBUG: Number of llvmPasses in config: 4
+DEBUG: Pass: retdec-provider-init
+DEBUG: Pass: retdec-decoder
+DEBUG: Pass: verify
+DEBUG: Pass: retdec-write-ll
+Running phase: Providers initialization ( 0.02s )
+Running phase: Input binary to LLVM IR decoding ( 0.02s )
+Running phase: LLVM ( 0.02s )
+Running phase: Generate the current LLVM IR ( 0.02s )
