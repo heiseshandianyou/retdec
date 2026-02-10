@@ -1,0 +1,22 @@
+# Ignore everything
+*
+
+# But descend into directories
+!*/
+
+# Whitelist files
+!*.sh
+!*.py
+!*.c
+!*.cpp
+!*.h
+!*.hpp
+!*.json
+!*.md
+!.gitignore
+
+# Ignore build/output directories even if they match above rules (if they contain allowed files but we want to ignore the folder itself, though !*/ usually allows them. Specific ignore might be needed if !*/ is too broad but usually okay)
+# Actually, if we !*/, git looks inside. If inside is build output like .o files, they are ignored by *.
+# If binary has no extension, it is ignored by *.
+# If binary is named 'pointer_analysis', it is ignored.
+# This seems correct for user request.
