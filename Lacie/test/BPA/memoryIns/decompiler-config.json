@@ -14,15 +14,7 @@
             "retdec-x87-fpu",
             "retdec-main-detection",
             "retdec-idioms-libgcc",
-            "retdec-inst-opt",
-            "retdec-syscalls",
-            "retdec-stack",
-            "retdec-constants",
-            "retdec-param-return",
-            "retdec-inst-opt-rda",
-            "retdec-inst-opt",
-            "retdec-simple-types",
-            "mem2reg",
+
             "retdec-write-ll"
         ]
     }

@@ -1,22 +1,22 @@
 Memory Access Test Analysis Summary
 ====================================
-Generated: Tue Feb 10 02:15:07 PM HKT 2026
+Generated: Tue Feb 10 08:43:01 PM HKT 2026
 
 Binary: test_memory_access_stripped
 LLVM IR: test_memory_access.ll
 
 LLVM IR Statistics:
-  load instructions:     112
-  store instructions:    738
+  load instructions:     789
+  store instructions:    1836
   getelementptr:         0
-  alloca:                15
-  call:                  76
-  ptrtoint:              50
-  inttoptr:              58
+  alloca:                0
+  call:                  172
+  ptrtoint:              0
+  inttoptr:              298
   bitcast:               
 
 Patterns:
-  Stack allocation:      15 alloca
-  Indirect calls:        14
+  Stack allocation:      0 alloca
+  Indirect calls:        0
   Pseudo calls:          9
   Address metadata:      0
