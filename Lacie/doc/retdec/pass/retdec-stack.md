@@ -96,258 +96,400 @@ for (SymbolicTree* n : root.getPostOrder())
 
 **关键函数**：`Abi::isStackPointerRegister()`
 
-各架构的栈指针寄存器：
-| 架构 | 栈指针寄存器 |
-|-----|-------------|
-| x86 | `esp` (32-bit) |
-| x64 | `rsp` (64-bit) |
-| ARM | `sp` |
-| ARM64 | `sp` |
-| MIPS | `sp` |
-| PowerPC | `r1` |
+### ⚠️ 重要澄清：只识别栈指针，不包括帧指针
 
-#### 步骤 3：计算栈偏移
+`isStackPointerRegister()` 只返回**真正的栈指针寄存器**，不包括帧指针（RBP/EBP/BP）：
+
+| 架构 | 栈指针寄存器 (`isStackPointerRegister() == true`) | 帧指针寄存器 (`isStackPointerRegister() == false`) |
+|-----|--------------------------------------------------|--------------------------------------------------|
+| x86 | `esp` | `ebp` ❌ |
+| x64 | `rsp` | `rbp` ❌ |
+| ARM | `sp` | `fp`/`r11` ❌ |
+| ARM64 | `sp` | `fp`/`x29` ❌ |
+| MIPS | `sp` | `fp`/`s8` ❌ |
+| PowerPC | `r1` | - |
+
+**代码实现：**
+```cpp
+// abi.cpp
+bool Abi::isStackPointerRegister(const llvm::Value* val) const
+{
+    return getStackPointerRegister() == val;  // 只检查一个特定寄存器
+}
+
+// 各架构初始化（如 x64.cpp）
+_regStackPointerId = X86_REG_RSP;  // 只设置 RSP，不包括 RBP
+```
+
+### 那 RBP/EBP 访问怎么处理？
+
+**实际行为：** 根据源码分析，`handleInstruction` 中的逻辑如下：
+
+```cpp
+if (!root.isVal2ValMapUsed())
+{
+    bool stackPtr = false;
+    for (SymbolicTree* n : root.getPostOrder())
+    {
+        if (_abi->isStackPointerRegister(n->value))  // 只检查 SP，不包括 BP
+        {
+            stackPtr = true;
+            break;
+        }
+    }
+    if (!stackPtr)  // 如果不是栈指针，直接返回！
+    {
+        LOG << "===> no SP" << std::endl;
+        return;
+    }
+}
+```
+
+**结论：**
+- ✅ **RSP/ESP 访问**：能通过检查，被处理
+- ❌ **RBP/EBP 访问**：**不能**通过检查，**不会被处理**（除非 `isVal2ValMapUsed()` 返回 true，但这种情况罕见）
+
+**这意味着：**
+- Stack pass 主要处理基于 **RSP/ESP** 的栈访问
+- 基于 **RBP/EBP** 的局部变量访问**保持原样**（不会被转换为 alloca）
+
+#### 步骤 3：计算栈偏移（仅适用于 RSP/ESP 访问）
+
+**重要限制：** 只有包含 **RSP/ESP**（栈指针）的访问才会执行到这一步。RBP/EBP（帧指针）访问在第 2 步就被过滤掉了。
+
+提取相对于栈指针的偏移量：
 
 ```cpp
 std::optional<int> StackAnalysis::getBaseOffset(SymbolicTree& root)
 {
-    // 情况 1: 直接是常量
+    std::optional<int> baseOffset;
+    
+    // 情况 1: 直接是常量（例如 -4, -8, 16）
     if (auto* ci = dyn_cast_or_null<ConstantInt>(root.value))
     {
-        return ci->getSExtValue();  // 返回常量值作为偏移
+        baseOffset = ci->getSExtValue();
     }
-    
     // 情况 2: 寄存器 + 常量的模式
-    // 例如: [ebp + offset] 或 [rsp + offset]
-    for (SymbolicTree* n : root.getLevelOrder())
+    // 例如: [ebp - 4], [rsp + 16]
+    else
     {
-        if (isa<AddOperator>(n->value)
-                && n->ops.size() == 2
-                && isa<LoadInst>(n->ops[0].value)
-                && isa<ConstantInt>(n->ops[1].value))
+        for (SymbolicTree* n : root.getLevelOrder())
         {
-            auto* l = cast<LoadInst>(n->ops[0].value);
-            auto* ci = cast<ConstantInt>(n->ops[1].value);
-            
-            // 检查是否是寄存器 + 常量
-            if (_abi->isRegister(l->getPointerOperand()))
+            if (isa<AddOperator>(n->value)
+                    && n->ops.size() == 2
+                    && isa<LoadInst>(n->ops[0].value)
+                    && isa<ConstantInt>(n->ops[1].value))
             {
-                return ci->getSExtValue();  // 返回偏移量
+                auto* l = cast<LoadInst>(n->ops[0].value);
+                auto* ci = cast<ConstantInt>(n->ops[1].value);
+                
+                // 检查是否是寄存器 + 常量
+                if (_abi->isRegister(l->getPointerOperand()))
+                {
+                    baseOffset = ci->getSExtValue();
+                }
+                break;
             }
         }
     }
-    return std::nullopt;
+    return baseOffset;
 }
 ```
 
-**偏移计算示例：**
+**偏移计算示例（仅适用于栈指针访问）：**
 
-| x86 汇编 | 地址表达式 | 计算出的偏移 |
-|---------|-----------|-------------|
-| `mov [ebp-4], eax` | `ebp + (-4)` | `-4` |
-| `mov [ebp+8], ecx` | `ebp + 8` | `+8` (参数) |
-| `mov [rsp+16], rdx` | `rsp + 16` | `+16` |
+| x86 汇编 | 地址表达式 | 计算出的偏移 | 是否处理 | 说明 |
+|---------|-----------|-------------|---------|------|
+| `mov [ebp-4], eax` | `ebp + (-4)` | - | ❌ **不处理** | EBP 不是栈指针，保持原样 |
+| `mov [ebp+8], ecx` | `ebp + 8` | - | ❌ **不处理** | EBP 不是栈指针，保持原样 |
+| `mov [rsp+16], rdx` | `rsp + 16` | `+16` | ✅ **处理** | 临时栈空间（相对于 RSP） |
+| `push rax` | `rsp - 8` | `-8` | ✅ **处理** | 栈顶操作（相对于 RSP） |
 
-#### 步骤 4：查找调试信息
+---
 
-```cpp
-// 尝试从调试信息获取变量名
-auto* debugSv = getDebugStackVariable(inst->getFunction(), root);
+## 4. 栈偏移识别的核心机制
 
-// 尝试从配置文件获取变量名
-auto* configSv = getConfigStackVariable(inst->getFunction(), root);
-```
+### 4.1 如何确定一个值是"栈上的偏移"
 
-**调试信息查找逻辑：**
-1. 计算栈偏移
-2. 在调试信息的 `locals` 列表中查找匹配的栈变量
-3. 比较栈偏移是否相等
-
-#### 步骤 5：创建/获取局部变量
+Stack Pass 通过以下**组合条件**判断：
 
 ```cpp
-// 使用 IrModifier 创建或获取栈变量
-auto p = irModif.getStackVariable(
-    inst->getFunction(),    // 当前函数
-    ci->getSExtValue(),     // 栈偏移
-    t,                      // 变量类型
-    name,                   // 变量名（来自调试信息或自动生成）
-    realName,               // 真实名称
-    debugSv || configSv     // 是否有调试信息
-);
-
-AllocaInst* a = p.first;    // 获取创建的 alloca
-```
-
-#### 步骤 6：替换指令
-
-```cpp
-// 情况 1: Store 指令
-if (s && s->getPointerOperand() == val)
+void StackAnalysis::handleInstruction(...)
 {
-    auto* conv = IrModifier::convertValueToType(
-            s->getValueOperand(),
-            a->getType()->getElementType(),
-            inst);
-    new StoreInst(conv, a, inst);    // 创建新的 store 到 alloca
-    _toRemove.insert(s);              // 标记原指令删除
+    // 1. 构建符号树（展开地址计算表达式）
+    auto root = SymbolicTree::PrecomputedRdaWithValueMap(RDA, val, &val2val);
+    
+    // 2. 检查表达式树中是否包含栈指针寄存器
+    bool stackPtr = false;
+    for (SymbolicTree* n : root.getPostOrder())
+    {
+        if (_abi->isStackPointerRegister(n->value))  // 是 RSP/ESP/RBP/EBP 吗？
+        {
+            stackPtr = true;
+            break;
+        }
+    }
+    
+    // 3. 如果不包含栈指针，直接返回
+    if (!stackPtr)
+    {
+        LOG << "===> no SP" << std::endl;
+        return;
+    }
+    
+    // 4. 简化表达式（常量折叠）
+    root.simplifyNode();
+    
+    // 5. 提取偏移量
+    auto* ci = dyn_cast_or_null<ConstantInt>(root.value);
+    if (ci == nullptr)
+    {
+        return;  // 无法简化为常量，无法处理
+    }
+    int64_t offset = ci->getSExtValue();  // 这就是栈偏移！
+    
+    // 6. 创建局部变量
+    // ...
 }
-// 情况 2: Load 指令
-else if (l && l->getPointerOperand() == val)
-{
-    auto* nl = new LoadInst(a, "", l);  // 从 alloca 加载
-    auto* conv = IrModifier::convertValueToType(nl, l->getType(), l);
-    l->replaceAllUsesWith(conv);         // 替换所有使用
-    _toRemove.insert(l);                 // 标记原指令删除
-}
+```
+
+### 4.2 Stack Pass 实际处理的访问模式
+
+#### ❌ 模式 A：基于帧指针（RBP/EBP）- **不被 Stack Pass 处理**
+
+**重要事实：**
+- `isStackPointerRegister()` **只识别 SP 寄存器**，不识别 BP 寄存器
+- 基于 RBP/EBP 的访问在 `handleInstruction` 第 2 步就被过滤掉
+- **Stack Pass 不处理、不转换 RBP/EBP 访问**
+
+```asm
+; 基于 EBP 的访问（保持原样，不转换）
+mov [ebp-4], eax   ; ❌ 不处理
+mov [ebp-8], ebx   ; ❌ 不处理
+mov eax, [ebp+8]   ; ❌ 不处理（函数参数）
+```
+
+**保持原样的 IR：**
+```llvm
+; Stack Pass 不会修改这些指令
+%ebp = load i64, i64* @ebp
+%addr = add i64 %ebp, -4
+%ptr = inttoptr i64 %addr to i32*
+store i32 %val, i32* %ptr   ; 保持复杂的地址计算
 ```
 
 ---
 
-## 4. 栈顶/栈底识别机制
+#### ✅ 模式 B：基于栈指针（RSP/ESP）- **Stack Pass 处理的唯一模式**
 
-### 4.1 栈帧布局模型
+**这是 Stack Pass 实际处理的唯一模式：**
+```
 
-RetDec 使用以下模型识别栈变量：
+#### 模式 B：基于栈指针（RSP/ESP）- 复杂
+
+**特征：** 直接使用 RSP 访问栈
+
+```asm
+sub rsp, 32       ; 分配栈空间
+mov [rsp+24], rax ; 保存寄存器，offset = +24
+mov [rsp+16], rbx ; 保存寄存器，offset = +16
+
+; 中间可能有其他操作改变 RSP...
+
+mov rax, [rsp+24] ; 恢复寄存器
+add rsp, 32       ; 恢复栈
+```
+
+**问题：RSP 在运行中变化**
+
+| 指令 | 执行后 RSP 值 | 访问位置计算 |
+|-----|-------------|-------------|
+| `sub rsp, 32` | RSP₀ - 32 | - |
+| `mov [rsp+24], rax` | RSP₀ - 32 | (RSP₀-32)+24 = **RSP₀-8** |
+| `call some_func` | RSP₀ - 40 | push 返回地址 |
+| `mov rax, [rsp+24]` | RSP₀ - 40 | (RSP₀-40)+24 = **RSP₀-16** ❌ |
+
+**Stack Pass 的局限性：**
+
+```cpp
+// 只提取表达式中的常量部分
+if (isa<ConstantInt>(n->ops[1].value)) {
+    return ci->getSExtValue();  // 返回 +24
+}
+
+// 不追踪 RSP 在运行时的动态变化！
+```
+
+**结果：**
+- `[rsp+24]` 在 **位置 A** 和 **位置 B** 可能被当作**同一个偏移**处理
+- 但实际上它们相对于函数入口的偏移是不同的
+
+### 4.3 RDA 的作用和局限
+
+**RDA 能做什么：**
+```cpp
+// 追踪简单的常量传播
+%rsp_after_sub = sub i64 %rsp, 32   ; RDA 知道这是 RSP₀ - 32
+%addr = add i64 %rsp_after_sub, 24  ; RDA 能计算出 RSP₀ - 8
+```
+
+**RDA 不能做什么：**
+```asm
+; 复杂控制流
+sub rsp, 32
+jz label_a
+add rsp, 8    ; 路径 1: RSP = RSP₀ - 24
+jmp label_b
+label_a:
+add rsp, 16   ; 路径 2: RSP = RSP₀ - 16
+label_b:
+; 此时 RSP 可能是 RSP₀-24 或 RSP₀-16（RDA 会合并）
+mov [rsp+8], rax  ; 无法确定具体偏移
+```
+
+---
+
+## 5. 栈顶/栈底识别机制
+
+### 5.1 栈帧布局模型
 
 ```
 高地址
-┌─────────────────┐
-│   返回地址       │  <- ebp + 4 (x86)
+┌─────────────────┐ ← RBP + 16 (参数 3)
+│   参数 2         │ ← RBP + 12
 ├─────────────────┤
-│   保存的 ebp     │  <- ebp (基址指针)
+│   参数 1         │ ← RBP + 8
 ├─────────────────┤
-│   局部变量 1     │  <- ebp - 4
-│   局部变量 2     │  <- ebp - 8
+│   返回地址       │ ← RBP + 4 (x86 32-bit)
+├─────────────────┤
+│   保存的 EBP     │ ← EBP (基址指针，稳定参考点)
+├─────────────────┤
+│   局部变量 1     │ ← EBP - 4
+│   局部变量 2     │ ← EBP - 8
 │      ...        │
-│   局部变量 N     │  <- ebp - N*4
+│   局部变量 N     │ ← EBP - N*4
 ├─────────────────┤
-│   临时空间       │  <- esp (栈指针)
-└─────────────────┘
+│   临时空间       │ ← ESP (栈指针，动态变化)
+└─────────────────┘ ← 栈向下增长
 低地址
 ```
 
-### 4.2 正负偏移的区分
+### 5.2 Stack Pass 处理的偏移类型
 
-| 偏移范围 | 说明 | 示例 |
-|---------|------|------|
-| **负偏移** (ebp - N) | 局部变量 | `[ebp-4]`, `[ebp-8]` |
-| **正偏移** (ebp + N) | 函数参数 | `[ebp+8]`, `[ebp+12]` |
-| **rsp 偏移** | 临时栈空间 | `[rsp+16]` |
+| 偏移范围 | 访问类型 | 参考点 | 是否处理 | 稳定性 |
+|---------|---------|-------|---------|-------|
+| **负偏移** `[ebp - N]` | 局部变量 | EBP | ❌ **不处理** | - |
+| **正偏移** `[ebp + N]` | 函数参数 | EBP | ❌ **不处理** | - |
+| **RSP 偏移** `[rsp + N]` | 临时栈空间 | RSP | ✅ **处理** | ⭐ 动态变化 |
+| **RSP 偏移** `[rsp - N]` | push 操作 | RSP | ✅ **处理** | ⭐ 动态变化 |
 
-### 4.3 识别逻辑
+**关键区别：**
+- Stack Pass **只处理 RSP/ESP 访问**，不处理 RBP/EBP 访问
+- RBP/EBP 访问保持原样（复杂的地址计算）
+
+### 5.3 代码中的区分逻辑
 
 ```cpp
-// 在 getBaseOffset() 中
-if (isa<AddOperator>(n->value) && n->ops.size() == 2)
-{
-    // 模式: 寄存器 + 常量偏移
-    // 例如: add i64 %ebp, -4
-    auto* ci = cast<ConstantInt>(n->ops[1].value);
-    int64_t offset = ci->getSExtValue();
-    
-    // offset < 0: 局部变量 (ebp - N)
-    // offset > 0: 函数参数 (ebp + N)
-}
+// Stack pass 不区分正负偏移，只提取常量值
+int64_t offset = ci->getSExtValue();
+
+// offset < 0: 通常是局部变量（相对于 RBP）
+// offset > 0: 可能是参数（相对于 RBP）或临时空间（相对于 RSP）
+
+// 创建 alloca 时使用该偏移作为标识
+auto p = irModif.getStackVariable(
+    inst->getFunction(),
+    offset,        // 栈偏移作为唯一标识
+    t,             // 类型
+    name,          // 变量名
+    ...
+);
 ```
 
 ---
 
-## 5. SymbolicTree 的作用
+## 6. 实际转换示例详解
 
-### 5.1 符号树构建
+### 6.1 RBP 访问 - **不被处理**
 
-`SymbolicTree` 用于表示和展开复杂的地址计算表达式：
+**输入汇编：**
+```asm
+mov [ebp-4], eax   ; 基于 EBP 的局部变量赋值
+```
 
+**Decoder 输出：**
 ```llvm
-; 原始表达式
+%ebp = load i64, i64* @ebp
 %addr = add i64 %ebp, -4
-
-; 符号树表示
-AddOperator (add)
-├── LoadInst (ebp)
-│   └── GlobalVariable (@ebp)
-└── ConstantInt (-4)
+%ptr = inttoptr i64 %addr to i32*
+store i32 %eax_val, i32* %ptr
 ```
 
-### 5.2 展开过程
-
+**Stack Pass 处理：**
 ```cpp
-SymbolicTree::expandNode(
-    ReachingDefinitionsAnalysis* RDA,
-    ...,
-    bool linear)
+// 检查栈指针
+for (SymbolicTree* n : root.getPostOrder())
 {
-    // 根据值的类型展开节点
-    if (isa<AddOperator>(value))
+    if (_abi->isStackPointerRegister(n->value))
     {
-        // 展开加法操作的两个操作数
-        ops.emplace_back(...);
-        ops.emplace_back(...);
+        // @ebp 不是栈指针（isStackPointerRegister 返回 false）
+        stackPtr = true;  // 不会执行到这里
+        break;
     }
-    else if (isa<LoadInst>(value))
-    {
-        // 如果是 load，可以继续展开定值
-        if (RDA)
-        {
-            auto* def = RDA->getDef(...);
-            // 展开定值...
-        }
-    }
-    // ... 其他类型
+}
+
+if (!stackPtr)
+{
+    LOG << "===> no SP" << std::endl;
+    return;  // ❌ 直接返回，不做任何处理！
 }
 ```
 
-### 5.3 简化节点
-
-```cpp
-root.simplifyNode();
+**输出（保持原样）：**
+```llvm
+; 与输入相同，未被修改
+%ebp = load i64, i64* @ebp
+%addr = add i64 %ebp, -4
+%ptr = inttoptr i64 %addr to i32*
+store i32 %eax_val, i32* %ptr
 ```
-
-简化过程会折叠常量表达式，例如：
-- `(ebp + 4) + (-8)` → `ebp + (-4)`
-- `(rsp + 16) - 8` → `rsp + 8`
 
 ---
 
-## 6. 调试信息的利用
+### 6.2 RSP 访问 - **被处理**
 
-### 6.1 调试信息匹配
-
-```cpp
-const retdec::common::Object* StackAnalysis::getDebugStackVariable(
-        llvm::Function* fnc,
-        SymbolicTree& root)
-{
-    // 1. 计算栈偏移
-    auto baseOffset = getBaseOffset(root);
-    if (!baseOffset.has_value()) return nullptr;
-    
-    // 2. 从调试格式获取函数信息
-    auto* debugFnc = _dbgf->getFunction(_config->getFunctionAddress(fnc));
-    if (debugFnc == nullptr) return nullptr;
-    
-    // 3. 遍历局部变量，匹配栈偏移
-    for (auto& var : debugFnc->locals)
-    {
-        if (!var.getStorage().isStack()) continue;
-        
-        if (var.getStorage().getStackOffset() == baseOffset)
-        {
-            return &var;  // 找到匹配的变量
-        }
-    }
-    return nullptr;
-}
+**输入汇编：**
+```asm
+sub rsp, 16
+mov [rsp+8], rax
 ```
 
-### 6.2 命名策略
+**Decoder 输出：**
+```llvm
+; 简化表示
+%rsp_old = load i64, i64* @rsp
+%rsp_new = sub i64 %rsp_old, 16
+store i64 %rsp_new, i64* @rsp
+%addr = add i64 %rsp_new, 8   ; offset = +8
+%ptr = inttoptr i64 %addr to i64*
+store i64 %rax, i64* %ptr
+```
 
-| 信息来源 | 命名方式 | 优先级 |
-|---------|---------|-------|
-| 调试信息 | 原始变量名（如 `local_count`） | 最高 |
-| 配置文件 | 配置中的变量名 | 中 |
-| 自动生成 | `stack_var_X` 或基于偏移 | 低 |
+**问题：**
+- Stack pass 提取的 offset 是 `+8`
+- 但这个 `+8` 是相对于 `%rsp_new`（RSP₀ - 16）
+- 相对于函数入口的实际偏移是：(RSP₀ - 16) + 8 = RSP₀ - 8
+
+**RDA 的作用：**
+```cpp
+// RDA 追踪到 %rsp_new 是 RSP₀ - 16
+// SymbolicTree 展开时可能传播这个信息
+// 但实际源码中简化后只提取 +8
+```
+
+**局限性：**
+- 如果后面有 `add rsp, 16` 恢复栈，RDA 可能能追踪
+- 但如果 RSP 变化复杂（如条件分支），可能无法准确追踪
 
 ---
 
@@ -355,113 +497,123 @@ const retdec::common::Object* StackAnalysis::getDebugStackVariable(
 
 ### 7.1 无法处理的情况
 
-| 情况 | 原因 | 结果 |
-|-----|------|------|
-| **动态栈分配** | `alloca` 大小是变量 | 无法确定偏移 |
-| **复杂的指针算术** | 多级指针操作 | 可能无法展开 |
-| **寄存器别名** | 使用非标准栈指针 | 无法识别 |
-| **优化的代码** | 高度优化的栈操作 | 模式匹配失败 |
+| 情况 | 原因 | Stack Pass 行为 |
+|-----|------|----------------|
+| **动态栈分配** | `alloca` 大小是变量 | 无法确定偏移，跳过 |
+| **复杂的指针算术** | 多级加减 | 简化失败，跳过 |
+| **寄存器别名** | 使用非标准栈指针 | 无法识别，跳过 |
+| **高度优化的代码** | 指令重排 | 模式匹配失败 |
+| **跨函数栈访问** | 通过指针传递栈地址 | 无法识别为栈变量 |
 
 ### 7.2 保守策略
 
 ```cpp
-// 如果无法识别为栈访问，直接返回不做处理
-if (!stackPtr)
-{
-    LOG << "===> no SP" << std::endl;
-    return;
-}
-
-// 如果无法简化为常量，无法处理
+// 如果无法简化为常量，直接返回
 auto* ci = dyn_cast_or_null<ConstantInt>(root.value);
 if (ci == nullptr)
 {
-    return;
+    return;  // 不处理，保留原样
+}
+
+// 如果不是栈指针相关的访问
+if (!stackPtr)
+{
+    return;  // 不处理
+}
+```
+
+**结果：** 复杂情况保持原样，不强行转换，避免错误。
+
+---
+
+## 8. 与 BPA 的关系
+
+### 8.1 Stack Pass 的实际输出
+
+**Stack Pass 创建 `alloca` 的情况：**
+- ✅ **基于 RSP/ESP 的访问**：转换为 `alloca`
+- ❌ **基于 RBP/EBP 的访问**：**不转换**，保持原样
+
+**BPA 面临的实际情况：**
+- 只有 **RSP/ESP 访问**生成的 `alloca` 能被识别为栈块
+- **RBP/EBP 访问**保持为复杂地址计算，BPA 需要额外处理才能识别
+
+### 8.2 BPA 需要注意的问题
+
+**实际情况：**
+1. **RSP 访问被转换**：生成 `alloca`，BPA 可直接识别为栈块
+2. **RBP 访问保持原样**：复杂的地址计算，BPA 需要额外处理
+
+**建议：**
+1. **识别 RSP 生成的 alloca**：这些是明确的栈块
+2. **额外处理 RBP 访问**：需要分析 `[ebp+offset]` 模式识别栈变量
+3. **谨慎处理 RSP 的动态变化**：如果函数有复杂的栈操作，offset 可能不准确
+
+**验证方法：**
+```bash
+# 检查 RSP 访问生成的 alloca
+grep "alloca" output.ll | wc -l
+
+# 检查未转换的 RBP 访问（保持原样）
+grep "load.*@ebp\|store.*@ebp" output.ll | wc -l
+
+# 检查未转换的 RSP 访问（复杂的栈操作）
+grep "load.*@rsp\|store.*@rsp" output.ll | wc -l
+```
+
+### 8.3 推荐配置
+
+```json
+{
+    "decompParams": {
+        "llvmPasses": [
+            "retdec-decoder",
+            "retdec-stack",              // ✅ 保留：创建栈变量 alloca
+            // "retdec-stack-ptr-op-remove", // 可选：进一步规范化 RSP 操作
+            // "retdec-register-localization", // ❌ BPA 禁用
+            // "mem2reg",                      // ❌ BPA 禁用
+            "retdec-write-ll"
+        ]
+    }
 }
 ```
 
 ---
 
-## 8. 与其他 Pass 的关系
+## 9. 总结
 
-### 8.1 Pipeline 位置
+### 9.1 核心机制回顾
 
-```
-decoder -> stack -> register-localization -> mem2reg -> ...
-   ↓          ↓                ↓               ↓
-机器码    栈变量识别     全局寄存器      提升为 SSA
-        (alloca)       转为局部        虚拟寄存器
-```
+| 步骤 | 操作 | 关键代码 |
+|-----|------|---------|
+| **识别** | 检查是否包含栈指针寄存器 | `isStackPointerRegister()` |
+| **展开** | 构建符号树，展开地址计算 | `SymbolicTree::PrecomputedRdaWithValueMap()` |
+| **简化** | 常量折叠，简化表达式 | `root.simplifyNode()` |
+| **提取** | 获取常量偏移 | `getBaseOffset()` |
+| **创建** | 创建/获取局部 alloca | `getStackVariable()` |
+| **替换** | 替换原有内存访问 | `new StoreInst/loadInst` |
 
-### 8.2 与 BPA 的关系
+### 9.2 关键澄清：Stack Pass 只处理 RSP/ESP 访问
 
-**对 BPA 的重要性：**
-- `stack` pass **创建** `alloca` 指令，标识栈内存块
-- BPA 需要这些 `alloca` 来识别**栈内存块**
-- **建议 BPA 复现时保留此 pass**，否则无法分析栈变量
+| 访问模式 | 是否处理 | 转换结果 | 说明 |
+|---------|---------|---------|------|
+| `[rsp + N]` / `[rsp - N]` | ✅ **处理** | `alloca` + 简化访问 | 临时栈空间、push/pop |
+| `[ebp - N]` / `[ebp + N]` | ❌ **不处理** | 保持复杂地址计算 | 局部变量/参数（保持原样）|
 
-### 8.3 与 mem2reg 的关系
+**重要事实：**
+- `isStackPointerRegister()` **只识别 SP**，不识别 BP
+- RBP/EBP 访问在 `handleInstruction` 第 2 步被过滤掉
+- 只有基于 **RSP/ESP** 的访问会被转换为 `alloca`
 
-| 阶段 | IR 形式 | 说明 |
-|-----|---------|------|
-| decoder 后 | 全局变量 `@rax`, `@rsp` + 复杂地址计算 | 最低级 |
-| stack 后 | `alloca` + 简单 load/store | 中级 |
-| mem2reg 后 | SSA 虚拟寄存器 | 最高级 |
+**参考基准：**
+- **RSP 访问**：参考点是动态的（访问时刻的 RSP），Stack Pass 处理
+- **RBP 访问**：参考点是稳定的（函数入口的 RBP），**Stack Pass 不处理**
 
-**BPA 建议停在 stack 阶段**，不要运行 mem2reg。
+### 9.3 对于 BPA 的建议
 
----
-
-## 9. 调试技巧
-
-### 9.1 查看转换前后的 IR
-
-```bash
-# 运行到 stack pass 前
-retdec-decompiler --stop-after decoder binary -o before.ll
-
-# 运行 stack pass
-opt -load libretdec.so -retdec-stack before.ll -o after.ll
-
-# 对比
-diff before.ll after.ll
-```
-
-### 9.2 检查栈变量识别
-
-```bash
-# 统计 alloca 数量（stack pass 创建）
-grep -c "alloca" output.ll
-
-# 查看栈变量名
-grep "alloca" output.ll | head -20
-```
-
-### 9.3 日志输出
-
-设置日志级别查看详细过程：
-```cpp
-LOG << "===> " << llvmObjToString(ci) << std::endl;
-LOG << "===> " << ci->getSExtValue() << std::endl;
-LOG << "===> " << llvmObjToString(a) << std::endl;
-```
-
----
-
-## 10. 总结
-
-`retdec-stack` 是 RetDec 栈分析的核心 Pass，它：
-
-1. **识别栈指针模式**：通过 ABI 识别各架构的栈指针寄存器
-2. **计算栈偏移**：使用符号树展开和简化地址表达式
-3. **创建局部变量**：将栈位置转换为 LLVM `alloca`
-4. **利用调试信息**：恢复原始变量名（如果可用）
-
-**对于 BPA 复现**：
-- ✅ **必须运行**，创建 `alloca` 供 BPA 识别栈内存块
-- ⚠️ **不要运行 mem2reg**，否则会消除 `alloca`
-
-**关键输出**：
-- 带有 `alloca` 的 LLVM IR
-- 简化后的栈访问（直接对 `alloca` 的 load/store）
-- 保留的调试信息变量名
+1. **识别两种栈访问**：
+   - RSP 访问 → `alloca`（已被 Stack Pass 转换）
+   - RBP 访问 → 复杂地址计算（保持原样，需额外处理）
+2. **注意 RSP 的动态变化**：复杂的栈操作可能导致 offset 不准确
+3. **结合调试信息**：如果有 DWARF 信息，可以验证变量位置
+4. **保守处理**：对于无法确定的情况，保持原始内存访问
