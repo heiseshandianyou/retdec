@@ -1,0 +1,55 @@
+{
+    "decompParams": {
+        "verboseOut": true,
+        "outputFormat": "plain",
+        "keepAllFuncs": false,
+        "selectedDecodeOnly": false,
+        "detectStaticCode": true,
+        "backendDisabledOpts": "",
+        "backendEnabledOpts": "",
+        "backendCallInfoObtainer": "optim",
+        "backendVarRenamer": "readable",
+        "backendNoOpts": false,
+        "backendEmitCfg": false,
+        "backendEmitCg": false,
+        "backendKeepAllBrackets": false,
+        "backendKeepLibraryFuncs": false,
+        "backendNoTimeVaryingInfo": false,
+        "backendNoVarRenaming": false,
+        "backendNoCompoundOperators": false,
+        "backendNoSymbolicNames": false,
+        "timeout": 0,
+        "maxMemoryLimit": 0,
+        "maxMemoryLimitHalfRam": true,
+        "ordinalNumDirectory": "./support/ordinals/",
+        "staticSignPaths": [
+            "./support/generic/yara_patterns/static-code/"
+        ],
+        "libraryTypeInfoPaths": [
+            "./support/generic/types/arm.json",
+            "./support/generic/types/cstdlib.json",
+            "./support/generic/types/linux.json",
+            "./support/generic/types/windows.json",
+            "./support/generic/types/windrivers.json"
+        ],
+        "cryptoPatternPaths": [
+            "./support/generic/yara_patterns/signsrch/signsrch.yarac",
+            "./support/generic/yara_patterns/signsrch/signsrch_regex.yarac"
+        ],
+        "outputLlFile": "test_stack_patterns.ll",
+        "llvmPasses" : [
+            "retdec-provider-init",
+            "retdec-decoder",
+            "verify",
+            "retdec-x86-addr-spaces",
+            "retdec-x87-fpu",
+            "retdec-main-detection",
+            "retdec-idioms-libgcc",
+            "retdec-inst-opt",
+            "retdec-cond-branch-opt",
+            "retdec-syscalls",
+            "retdec-stack",
+            "retdec-write-ll"
+        ]
+    }
+}

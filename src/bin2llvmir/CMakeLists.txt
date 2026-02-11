@@ -56,6 +56,8 @@ add_library(bin2llvmir STATIC
 	optimizations/select_functions/select_functions.cpp
 	optimizations/simple_types/simple_types.cpp
 	optimizations/stack/stack.cpp
+	optimizations/bpa/bpa_stack.cpp
+	optimizations/bpa/bpa_boundary_collector.cpp
 	optimizations/stack_pointer_ops/stack_pointer_ops.cpp
 	optimizations/value_protect/value_protect.cpp
 	optimizations/writer_bc/writer_bc.cpp

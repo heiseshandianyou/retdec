@@ -11,7 +11,7 @@ BUILDS_DIR="$SCRIPT_DIR/builds"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
 # RetDec paths
-RETDEC_ROOT="${RETDEC_ROOT:-$SCRIPT_DIR/../../../../build}"
+RETDEC_ROOT="${RETDEC_ROOT:-$SCRIPT_DIR/../../../../../build}"
 RETDEC_BIN="$RETDEC_ROOT/src/retdec-decompiler/retdec-decompiler"
 RETDEC_SHARE="$RETDEC_ROOT/share/retdec"
 
@@ -84,6 +84,7 @@ build_test() {
 # Disassemble with objdump (Intel format)
 analyze_objdump() {
     print_section "1. Objdump Disassembly Analysis (Intel Syntax)"
+    mkdir -p "$OUTPUT_DIR"
     
     local binary="$BUILDS_DIR/${TEST_NAME}_stripped"
     local asm_file="$OUTPUT_DIR/${TEST_NAME}_objdump.asm"

@@ -1,0 +1,38 @@
+{
+    "decompParams": {
+        "verboseOut": true,
+        "outputFormat": "plain",
+        "keepAllFuncs": true,
+        "outputLlFile": "test_boundary_collection.ll",
+        "ordinalNumDirectory": "./support/ordinals/",
+        "staticSignPaths": [
+            "./support/generic/yara_patterns/static-code/"
+        ],
+        "libraryTypeInfoPaths": [
+            "./support/generic/types/arm.json",
+            "./support/generic/types/cstdlib.json",
+            "./support/generic/types/linux.json",
+            "./support/generic/types/windows.json",
+            "./support/generic/types/windrivers.json"
+        ],
+        "cryptoPatternPaths": [
+            "./support/generic/yara_patterns/signsrch/signsrch.yarac",
+            "./support/generic/yara_patterns/signsrch/signsrch_regex.yarac"
+        ],
+        "llvmPasses" : [
+            "retdec-provider-init",
+            "retdec-decoder",
+            "verify",
+            "retdec-x86-addr-spaces",
+            "retdec-x87-fpu",
+            "retdec-main-detection",
+            "retdec-idioms-libgcc",
+            "retdec-inst-opt",
+            "retdec-cond-branch-opt",
+            "retdec-syscalls",
+            "retdec-bpa-boundary-collector",
+            "verify",
+            "retdec-write-ll"
+        ]
+    }
+}
