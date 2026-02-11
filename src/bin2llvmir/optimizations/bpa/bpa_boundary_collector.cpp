@@ -8,6 +8,8 @@
 
 #include <capstone/x86.h>
 
+#define debug_enabled false
+
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instruction.h>
@@ -105,29 +107,75 @@ StackBoundaryInfo BPABoundaryCollector::analyzeFunction(llvm::Function& f)
 		info.functionAddress = _config->getFunctionAddress(&f);
 	}
 
-	// Assume standard frame setup: rbp = top - 8
-	int64_t rbpToTopOffset = -8;
+	// Track current RSP offset relative to top during analysis
+	// At function entry: RSP = top, offset = 0
+	int64_t currentRSPOffset = 0;
+	int64_t rbpToTopOffset = -8;  // rbp = top - 8 (standard frame)
+	
+	// Track dynamic stack regions (VLA, alloca)
+	// Key: region ID, Value: base offset from top
+	std::map<int, int64_t> dynamicRegionBases;
+	int nextRegionId = 0;
 
 	LOG << "Analyzing function: " << info.functionName << std::endl;
 
 	ReachingDefinitionsAnalysis RDA;
 	RDA.runOnModule(*_module, _abi);
 
-	// Collect all memory access instructions
+	// First pass: identify dynamic stack allocations (sub rsp / alloca patterns)
+	for (auto& bb : f)
+	{
+		for (auto& inst : bb)
+		{
+			// Look for RSP modifications that indicate dynamic allocation
+			if (auto* store = dyn_cast<StoreInst>(&inst))
+			{
+				if (_abi->isStackPointerRegister(store->getPointerOperand()))
+				{
+					// RSP is being modified
+					// Try to compute the change
+					auto root = SymbolicTree::OnDemandRda(store->getValueOperand());
+					auto offsetRes = calculateLinearOffset(&root);
+					
+					if (offsetRes && offsetRes->second)
+					{
+						// This might be a dynamic allocation
+						// For simplicity, we track significant RSP changes
+						if (offsetRes->first < -8)  // Larger than a single push
+						{
+							DynamicStackRegion region;
+							region.id = nextRegionId++;
+							region.baseOffsetFromTop = offsetRes->first;
+							region.size = 0;  // Unknown size
+							region.allocInstruction = &inst;
+							region.description = "Dynamic alloc at offset " + std::to_string(offsetRes->first);
+							info.dynamicRegions.push_back(region);
+							dynamicRegionBases[region.id] = region.baseOffsetFromTop;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Second pass: collect all stack accesses
 	for (auto& bb : f)
 	{
 		for (auto& inst : bb)
 		{
 			// Look for load/store that might be stack accesses
 			Value* pointerOperand = nullptr;
+			bool isLoad = false;
 			
 			if (auto* load = dyn_cast<LoadInst>(&inst))
 			{
 				pointerOperand = load->getPointerOperand();
+				isLoad = true;
 			}
 			else if (auto* store = dyn_cast<StoreInst>(&inst))
 			{
 				pointerOperand = store->getPointerOperand();
+				isLoad = false;
 			}
 
 			if (!pointerOperand || isa<GlobalVariable>(pointerOperand))
@@ -146,16 +194,18 @@ StackBoundaryInfo BPABoundaryCollector::analyzeFunction(llvm::Function& f)
 			
 			// Check if this involves stack pointer or base pointer
 			bool hasStackReg = false;
+			llvm::Value* baseReg = nullptr;
 			for (SymbolicTree* n : root.getPostOrder())
 			{
 				if (isStackRelatedRegister(n->value))
 				{
 					hasStackReg = true;
+					baseReg = n->value;
 					break;
 				}
 			}
 
-			if (!hasStackReg)
+			if (!hasStackReg || !baseReg)
 			{
 				continue;
 			}
@@ -171,32 +221,61 @@ StackBoundaryInfo BPABoundaryCollector::analyzeFunction(llvm::Function& f)
 				continue;
 			}
 
-			int64_t offset = normalizedOffset.value();
-			info.topRelativeOffsets.insert(offset);
-			info.instructionOffsets[&inst] = offset;
+			int64_t absoluteOffset = normalizedOffset.value();
+			info.topRelativeOffsets.insert(absoluteOffset);
 
-			// Classify by register type
-			for (SymbolicTree* n : root.getPostOrder())
+			// Create detailed access info
+			StackAccessInfo accessInfo;
+			accessInfo.instruction = &inst;
+			accessInfo.baseRegister = baseReg;
+			accessInfo.absoluteOffsetFromTop = absoluteOffset;
+			accessInfo.isLoad = isLoad;
+			
+			// Determine if this belongs to a dynamic region
+			accessInfo.dynamicRegionId = -1;  // Static by default
+			
+			// Check if this access falls within a dynamic region
+			for (const auto& region : info.dynamicRegions)
 			{
-				if (isRBPRegister(n->value))
+				// Simple heuristic: if absolute offset matches region base or is close
+				// In practice, we'd need more sophisticated tracking
+				if (absoluteOffset <= region.baseOffsetFromTop && 
+				    absoluteOffset > region.baseOffsetFromTop - 256)  // Assume max 256 bytes per region
 				{
-					info.rbpBasedOffsets.insert(offset);
-					info.rbpAccesses++;
-					break;
-				}
-				else if (_abi->isStackPointerRegister(n->value) ||
-				         (isa<GlobalVariable>(n->value) && 
-				          (n->value->getName() == "rsp" || n->value->getName() == "esp")))
-				{
-					info.rspBasedOffsets.insert(offset);
-					info.rspAccesses++;
+					accessInfo.dynamicRegionId = region.id;
+					accessInfo.relativeOffset = absoluteOffset - region.baseOffsetFromTop;
+					info.dynamicRegionAccesses++;
 					break;
 				}
 			}
+			
+			// If not in dynamic region, relative offset is from top or RBP
+			if (accessInfo.dynamicRegionId == -1)
+			{
+				if (isRBPRegister(baseReg))
+				{
+					accessInfo.relativeOffset = absoluteOffset - rbpToTopOffset;
+					info.rbpBasedOffsets.insert(accessInfo.relativeOffset);
+					info.rbpAccesses++;
+				}
+				else
+				{
+					accessInfo.relativeOffset = absoluteOffset;
+					info.rspBasedOffsets.insert(accessInfo.relativeOffset);
+					info.rspAccesses++;
+				}
+			}
+			
+			accessInfo.accessType = pointerOperand->getType();
+			info.stackAccesses.push_back(accessInfo);
+			
+			// Group by absolute offset
+			info.offsetToAccesses[absoluteOffset].push_back(accessInfo);
 		}
 	}
 
 	LOG << "  Collected " << info.topRelativeOffsets.size() << " boundary candidates" << std::endl;
+	LOG << "  Found " << info.dynamicRegions.size() << " dynamic stack regions" << std::endl;
 	
 	return info;
 }
@@ -391,8 +470,19 @@ void BPABoundaryCollector::printBoundaryReport(llvm::raw_ostream& os) const
 		os << "Function: " << info.functionName << "\n";
 		os << "  Address: 0x" << llvm::format_hex(info.functionAddress, 0) << "\n";
 		os << "  Total stack accesses: " << info.totalAccesses << "\n";
-		os << "  Successfully processed: " << info.topRelativeOffsets.size() << "\n";
+		os << "  Successfully processed: " << info.stackAccesses.size() << "\n";
 		os << "  Unprocessed: " << info.unprocessedAccesses << "\n";
+		
+		if (!info.dynamicRegions.empty())
+		{
+			os << "  Dynamic stack regions: " << info.dynamicRegions.size() << "\n";
+			for (const auto& region : info.dynamicRegions)
+			{
+				os << "    Region " << region.id << ": base=" << region.baseOffsetFromTop 
+				   << ", size=" << (region.size > 0 ? std::to_string(region.size) : "unknown")
+				   << " (" << region.description << ")\n";
+			}
+		}
 		
 		if (!info.topRelativeOffsets.empty())
 		{
@@ -409,7 +499,7 @@ void BPABoundaryCollector::printBoundaryReport(llvm::raw_ostream& os) const
 
 		if (!info.rspBasedOffsets.empty())
 		{
-			os << "  RSP-based offsets: [";
+			os << "  Static RSP-based offsets: [";
 			bool first = true;
 			for (int64_t offset : info.rspBasedOffsets)
 			{
@@ -432,6 +522,11 @@ void BPABoundaryCollector::printBoundaryReport(llvm::raw_ostream& os) const
 			}
 			os << "] (" << info.rbpAccesses << " accesses)\n";
 		}
+		
+		if (info.dynamicRegionAccesses > 0)
+		{
+			os << "  Dynamic region accesses: " << info.dynamicRegionAccesses << "\n";
+		}
 
 		os << "\n";
 	}
@@ -442,16 +537,22 @@ void BPABoundaryCollector::printBoundaryReport(llvm::raw_ostream& os) const
 	size_t totalBoundaries = 0;
 	size_t totalRspAccesses = 0;
 	size_t totalRbpAccesses = 0;
+	size_t totalDynamicAccesses = 0;
+	size_t totalDynamicRegions = 0;
 	for (const auto& info : _boundaryInfos)
 	{
 		totalBoundaries += info.topRelativeOffsets.size();
 		totalRspAccesses += info.rspAccesses;
 		totalRbpAccesses += info.rbpAccesses;
+		totalDynamicAccesses += info.dynamicRegionAccesses;
+		totalDynamicRegions += info.dynamicRegions.size();
 	}
 	
 	os << "  Total boundary candidates: " << totalBoundaries << "\n";
-	os << "  Total RSP-based accesses: " << totalRspAccesses << "\n";
-	os << "  Total RBP-based accesses: " << totalRbpAccesses << "\n";
+	os << "  Total static RSP accesses: " << totalRspAccesses << "\n";
+	os << "  Total RBP accesses: " << totalRbpAccesses << "\n";
+	os << "  Total dynamic region accesses: " << totalDynamicAccesses << "\n";
+	os << "  Total dynamic regions: " << totalDynamicRegions << "\n";
 	os << "\n";
 }
 

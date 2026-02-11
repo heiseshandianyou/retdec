@@ -40,6 +40,56 @@ namespace retdec {
 namespace bin2llvmir {
 
 /**
+ * Dynamic stack allocation region (e.g., from VLA or alloca)
+ */
+struct DynamicStackRegion
+{
+	// Unique ID for this region
+	int id;
+	
+	// Base address relative to "top" (function entry RSP)
+	// For example: -16 means this region starts at top - 16
+	int64_t baseOffsetFromTop;
+	
+	// Size of this region (if known, 0 if unknown/VLA)
+	int64_t size;
+	
+	// The instruction that creates this region (sub rsp, X or alloca)
+	llvm::Instruction* allocInstruction;
+	
+	// Human-readable description
+	std::string description;
+};
+
+/**
+ * Single stack access information with context
+ */
+struct StackAccessInfo
+{
+	// The instruction performing the access
+	llvm::Instruction* instruction;
+	
+	// Relative offset from the access base (e.g., [rsp+8] -> 8)
+	int64_t relativeOffset;
+	
+	// The base register used (RSP, RBP, or dynamic region base)
+	llvm::Value* baseRegister;
+	
+	// For dynamic stack regions: which region this access belongs to
+	// -1 means static region (normal stack frame)
+	int dynamicRegionId;
+	
+	// Absolute offset from "top" (computed as baseOffsetFromTop + relativeOffset)
+	int64_t absoluteOffsetFromTop;
+	
+	// Whether this is a load or store
+	bool isLoad;
+	
+	// Type of the access (i8, i32, i64, etc.)
+	llvm::Type* accessType;
+};
+
+/**
  * Stack boundary information for a single function
  */
 struct StackBoundaryInfo
@@ -55,13 +105,20 @@ struct StackBoundaryInfo
 	std::set<int64_t> rspBasedOffsets;  // [rsp + X]
 	std::set<int64_t> rbpBasedOffsets;  // [rbp + X]
 	
-	// Raw offsets from instructions (for debugging)
-	std::map<llvm::Instruction*, int64_t> instructionOffsets;
+	// Dynamic stack allocation regions (VLA, alloca)
+	std::vector<DynamicStackRegion> dynamicRegions;
+	
+	// Detailed access information for each stack access
+	std::vector<StackAccessInfo> stackAccesses;
+	
+	// Mapping from offset to list of accesses (for quick lookup)
+	std::map<int64_t, std::vector<StackAccessInfo>> offsetToAccesses;
 	
 	// Statistics
 	size_t totalAccesses = 0;
 	size_t rspAccesses = 0;
 	size_t rbpAccesses = 0;
+	size_t dynamicRegionAccesses = 0;
 	size_t unprocessedAccesses = 0;
 };
 
